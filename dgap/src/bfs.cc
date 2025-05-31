@@ -43,6 +43,211 @@ them in parent array as negative numbers. Thus the encoding of parent is:
 
 using namespace std;
 
+void bind_current_thread_to_cpu_list(const std::vector<int> &cpus) {
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  for (int cpu : cpus) {
+      CPU_SET(cpu, &cpuset);
+  }
+  pthread_t tid = pthread_self();
+  pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
+}
+
+
+int64_t BUStepNuma(const WGraph &g, pvector<NodeID> &parent, Bitmap &front,
+                   Bitmap &next) {
+  int64_t awake_count = 0;
+  next.reset();
+  
+  #pragma omp parallel
+  {
+    // Bind uma única vez por thread
+    int tid = omp_get_thread_num();
+    int numThreads = omp_get_num_threads();
+    int node_count = 2;
+    int64_t my_awake_count = 0;
+    
+    static const std::vector<int> node0_cpus = {
+      0,1,2,3,4,5,6,7,8,9,10,11,
+      24,25,26,27,28,29,30,31,32,33,34,35
+    };
+    static const std::vector<int> node1_cpus = {
+      12,13,14,15,16,17,18,19,20,21,22,23,
+      36,37,38,39,40,41,42,43,44,45,46,47
+    };
+    
+    int64_t start;
+    if ((tid % node_count) == 0) {
+      bind_current_thread_to_cpu_list(node0_cpus);
+      start = tid; // Pares
+    }
+    else {
+      bind_current_thread_to_cpu_list(node1_cpus);
+      start = tid; // Ímpares
+    }
+    
+    // Garantir que next.reset() foi concluído antes de prosseguir
+    #pragma omp barrier
+    
+    // Loop manual com stride, cada thread fica no seu nó
+    for (NodeID u = start; u < g.num_nodes(); u += numThreads) {
+      if (parent[u] < 0) {
+        for (NodeID v : g.in_neigh(u)) {
+          if (front.get_bit(v)) {
+            parent[u] = v;
+            my_awake_count++;
+            next.set_bit_atomic(u); // Usar versão atômica
+            break;
+          }
+        }
+      }
+    }
+    
+    // Garantir que todas as threads terminaram de processar antes da redução
+    #pragma omp barrier
+    
+    // Redução manual
+    #pragma omp atomic
+    awake_count += my_awake_count;
+    
+  } // fim do parallel
+  
+  return awake_count;
+}
+
+void QueueToBitmapNuma(const SlidingQueue<NodeID> &queue, Bitmap &bm) {
+  bm.reset(); // Limpar antes de começar
+  #pragma omp parallel
+  {
+    // Bind uma única vez por thread
+    int tid = omp_get_thread_num();
+    int numThreads = omp_get_num_threads();
+    int node_count = 2;
+    
+    static const std::vector<int> node0_cpus = {
+      0,1,2,3,4,5,6,7,8,9,10,11,
+      24,25,26,27,28,29,30,31,32,33,34,35
+    };
+    static const std::vector<int> node1_cpus = {
+      12,13,14,15,16,17,18,19,20,21,22,23,
+      36,37,38,39,40,41,42,43,44,45,46,47
+    };
+    
+    int64_t start;
+    if ((tid % node_count) == 0) {
+      bind_current_thread_to_cpu_list(node0_cpus);
+      start = tid; // Pares
+    }
+    else {
+      bind_current_thread_to_cpu_list(node1_cpus);
+      start = tid; // Ímpares
+    }
+    
+    // Garantir que reset foi concluído antes de prosseguir
+    //#pragma omp barrier
+    
+    // Loop manual com stride através da queue
+    int64_t queue_size = queue.end() - queue.begin();
+    for (int64_t i = start; i < queue_size; i += numThreads) {
+      auto q_iter = queue.begin() + i;
+      NodeID u = *q_iter;
+      bm.set_bit_atomic(u);
+    }
+    
+    // Garantir que todas as threads terminaram antes de sair
+    #pragma omp barrier
+    
+  } // fim do parallel
+}
+
+void BitmapToQueueNuma(const WGraph &g, const Bitmap &bm,
+                       SlidingQueue<NodeID> &queue) {
+  #pragma omp parallel
+  {
+    QueueBuffer<NodeID> lqueue(queue);
+    
+    // Bind uma única vez por thread
+    int tid = omp_get_thread_num();
+    int numThreads = omp_get_num_threads();
+    int node_count = 2;
+    
+    static const std::vector<int> node0_cpus = {
+      0,1,2,3,4,5,6,7,8,9,10,11,
+      24,25,26,27,28,29,30,31,32,33,34,35
+    };
+    static const std::vector<int> node1_cpus = {
+      12,13,14,15,16,17,18,19,20,21,22,23,
+      36,37,38,39,40,41,42,43,44,45,46,47
+    };
+    
+    int64_t start;
+    if ((tid % node_count) == 0) {
+      bind_current_thread_to_cpu_list(node0_cpus);
+      start = tid; // Pares
+    }
+    else {
+      bind_current_thread_to_cpu_list(node1_cpus);
+      start = tid; // Ímpares
+    }
+    
+    // Loop manual com stride
+    for (NodeID n = start; n < g.num_nodes(); n += numThreads) {
+      if (bm.get_bit(n))
+        lqueue.push_back(n);
+    }
+    lqueue.flush();
+    
+    // Garantir que todas as threads terminaram de processar
+    #pragma omp barrier
+    
+  } // fim do parallel
+  queue.slide_window();
+}
+
+
+pvector<NodeID> InitParentNuma(const WGraph &g) {
+  pvector<NodeID> parent(g.num_nodes());
+  
+  #pragma omp parallel
+  {
+    // Bind uma única vez por thread
+    int tid = omp_get_thread_num();
+    int numThreads = omp_get_num_threads();
+    int node_count = 2;
+    
+    static const std::vector<int> node0_cpus = {
+      0,1,2,3,4,5,6,7,8,9,10,11,
+      24,25,26,27,28,29,30,31,32,33,34,35
+    };
+    static const std::vector<int> node1_cpus = {
+      12,13,14,15,16,17,18,19,20,21,22,23,
+      36,37,38,39,40,41,42,43,44,45,46,47
+    };
+    
+    int64_t start;
+    if ((tid % node_count) == 0) {
+      bind_current_thread_to_cpu_list(node0_cpus);
+      start = tid; // Pares
+    }
+    else {
+      bind_current_thread_to_cpu_list(node1_cpus);
+      start = tid; // Ímpares
+    }
+    
+    // Loop manual com stride
+    for (NodeID n = start; n < g.num_nodes(); n += numThreads) {
+      parent[n] = g.out_degree(n) != 0 ? -g.out_degree(n) : -1;
+    }
+    
+    // Sincronização para garantir que todas as inicializações terminaram
+    #pragma omp barrier
+    
+  } // fim do parallel
+  
+  return parent;
+}
+
+
 int64_t BUStep(const WGraph &g, pvector<NodeID> &parent, Bitmap &front,
                Bitmap &next) {
   int64_t awake_count = 0;
@@ -118,6 +323,96 @@ pvector<NodeID> InitParent(const WGraph &g) {
     parent[n] = g.out_degree(n) != 0 ? -g.out_degree(n) : -1;
   return parent;
 }
+
+pvector<NodeID> DOBFSNuma(const WGraph &g, NodeID source, int alpha = 15,
+                          int beta = 18) {
+// PrintStep("Source", static_cast<int64_t>(source));
+  Timer t;
+  t.Start();
+  pvector<NodeID> parent = InitParentNuma(g);
+  t.Stop();
+// PrintStep("i", t.Seconds());
+  parent[source] = source;
+  SlidingQueue<NodeID> queue(g.num_nodes());
+  queue.push_back(source);
+  queue.slide_window();
+  Bitmap curr(g.num_nodes());
+  curr.reset();
+  Bitmap front(g.num_nodes());
+  front.reset();
+  int64_t edges_to_check = g.num_edges_directed();
+  int64_t scout_count = g.out_degree(source);
+  
+  while (!queue.empty()) {
+    if (scout_count > edges_to_check / alpha) {
+      int64_t awake_count, old_awake_count;
+      TIME_OP(t, QueueToBitmapNuma(queue, front));
+// PrintStep("e", t.Seconds());
+      awake_count = queue.size();
+      queue.slide_window();
+      do {
+        t.Start();
+        old_awake_count = awake_count;
+        awake_count = BUStepNuma(g, parent, front, curr);
+        front.swap(curr);
+        t.Stop();
+// PrintStep("bu", t.Seconds(), awake_count);
+      } while ((awake_count >= old_awake_count) ||
+               (awake_count > g.num_nodes() / beta));
+      TIME_OP(t, BitmapToQueueNuma(g, front, queue));
+// PrintStep("c", t.Seconds());
+      scout_count = 1;
+    } else {
+      t.Start();
+      edges_to_check -= scout_count;
+      scout_count = TDStep(g, parent, queue); // Esta função precisa ser adaptada também
+      queue.slide_window();
+      t.Stop();
+// PrintStep("td", t.Seconds(), queue.size());
+    }
+  }
+  
+  // Adaptação do loop final para NUMA
+  #pragma omp parallel
+  {
+    // Bind uma única vez por thread
+    int tid = omp_get_thread_num();
+    int numThreads = omp_get_num_threads();
+    int node_count = 2;
+    
+    static const std::vector<int> node0_cpus = {
+      0,1,2,3,4,5,6,7,8,9,10,11,
+      24,25,26,27,28,29,30,31,32,33,34,35
+    };
+    static const std::vector<int> node1_cpus = {
+      12,13,14,15,16,17,18,19,20,21,22,23,
+      36,37,38,39,40,41,42,43,44,45,46,47
+    };
+    
+    int64_t start;
+    if ((tid % node_count) == 0) {
+      bind_current_thread_to_cpu_list(node0_cpus);
+      start = tid; // Pares
+    }
+    else {
+      bind_current_thread_to_cpu_list(node1_cpus);
+      start = tid; // Ímpares
+    }
+    
+    // Loop manual com stride
+    for (NodeID n = start; n < g.num_nodes(); n += numThreads) {
+      if (parent[n] < -1)
+        parent[n] = -1;
+    }
+    
+    // Sincronização final
+    #pragma omp barrier
+    
+  } // fim do parallel
+  
+  return parent;
+}
+
 
 pvector<NodeID> DOBFS(const WGraph &g, NodeID source, int alpha = 15,
                       int beta = 18) {
