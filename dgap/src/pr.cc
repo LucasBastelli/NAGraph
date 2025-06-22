@@ -33,6 +33,94 @@ const float kDamp = 0.85;
 void PrintTopScores(const WGraph &g, const ScoreT *scores);
 void bind_current_thread_to_cpu_list(const std::vector<int> &cpus);
 
+/*
+ScoreT *PageRankPushNuma(const WGraph &g, int max_iters, double epsilon = 0) {
+    const int64_t num_nodes  = g.num_nodes();
+    const ScoreT  init_score = 1.0f / num_nodes;
+    const ScoreT  base_score = (1.0f - kDamp) / num_nodes;
+
+    // Usaremos double-buffering para os scores para garantir a correção.
+    ScoreT *scores      = (ScoreT*)malloc(sizeof(ScoreT) * num_nodes);
+    ScoreT *scores_new  = (ScoreT*)malloc(sizeof(ScoreT) * num_nodes);
+    // 'sums' acumulará o rank "empurrado" em cada iteração.
+    ScoreT *sums        = (ScoreT*)malloc(sizeof(ScoreT) * num_nodes);
+
+    // Inicialização inicial dos scores.
+    #pragma omp parallel for
+    for (int64_t i = 0; i < num_nodes; ++i) {
+        scores[i] = init_score;
+    }
+
+    // --- Região Paralela Única para Otimização NUMA ---
+    #pragma omp parallel
+    {
+        // --- Configuração da Afinidade NUMA (sua lógica original) ---
+        int tid = omp_get_thread_num();
+        int numThreads = omp_get_num_threads();
+        
+        static const std::vector<int> node0_cpus = {0,1,2,3,4,5,6,7,8,9,10,11,24,25,26,27,28,29,30,31,32,33,34,35};
+        static const std::vector<int> node1_cpus = {12,13,14,15,16,17,18,19,20,21,22,23,36,37,38,39,40,41,42,43,44,45,46,47};
+        
+        if ((tid % 2) == 0) {
+            bind_current_thread_to_cpu_list(node0_cpus);
+        } else {
+            bind_current_thread_to_cpu_list(node1_cpus);
+        }
+        
+        // --- Loop Principal de Iterações ---
+        for (int iter = 0; iter < max_iters; ++iter) {
+            // FASE 1: Limpar os acumuladores de soma para a nova iteração.
+            for (int64_t i = tid; i < num_nodes; i += numThreads) {
+                sums[i] = 0.0;
+            }
+
+            // Sincroniza para garantir que todos os `sums` estão zerados antes de continuar.
+            #pragma omp barrier
+
+            // FASE 2: "Empurrar" (Push) o rank para os vizinhos de saída.
+            for (int64_t u = tid; u < num_nodes; u += numThreads) {
+                if (g.out_degree(u) > 0) {
+                    ScoreT contrib = scores[u] / g.out_degree(u);
+                    // Usamos `in_neigh` pois sabemos que ela retorna os vizinhos de SAÍDA.
+                    for (NodeID v : g.in_neigh(u)) {
+                        // CORREÇÃO CRÍTICA: Operação Atômica
+                        // Previne que duas threads escrevam em `sums[v]` ao mesmo tempo,
+                        // o que causaria perda de dados (race condition).
+                        #pragma omp atomic
+                        sums[v] += contrib;
+                    }
+                }
+            }
+
+            // Sincroniza para garantir que todos os `sums` foram calculados.
+            #pragma omp barrier
+
+            // FASE 3: Atualizar os scores para a próxima iteração, escrevendo em `scores_new`.
+            for (int64_t u = tid; u < num_nodes; u += numThreads) {
+                scores_new[u] = base_score + kDamp * sums[u];
+            }
+            
+            // FASE 4: Trocar os buffers. Apenas uma thread faz a troca de ponteiros.
+            #pragma omp single
+            {
+                std::swap(scores, scores_new);
+            }
+            
+            // Sincroniza para garantir que todas as threads viram a troca
+            // antes de começar a próxima iteração.
+            #pragma omp barrier
+        }
+    } // Fim da região paralela
+
+    // Libera a memória dos buffers auxiliares.
+    free(scores_new);
+    free(sums);
+
+    // `scores` agora aponta para os resultados finais corretos.
+    return scores;
+}
+*/
+
 ScoreT *PageRankPullNuma(const WGraph &g, int max_iters, double epsilon = 0) {
   const int64_t num_nodes   = g.num_nodes();
   const ScoreT  init_score = 1.0f / num_nodes;
@@ -100,6 +188,7 @@ ScoreT *PageRankPullNuma(const WGraph &g, int max_iters, double epsilon = 0) {
   return scores;
 }
 
+
 ScoreT * PageRankPull(const WGraph &g, int max_iters,
   double epsilon = 0) {
   const ScoreT init_score = 1.0f / g.num_nodes();
@@ -137,6 +226,7 @@ ScoreT * PageRankPull(const WGraph &g, int max_iters,
   PrintTopScores(g, scores);
   return scores;
 }
+
 
 
 void bind_current_thread_to_cpu_list(const std::vector<int> &cpus) {
@@ -183,7 +273,9 @@ bool PRVerifier(const WGraph &g, const ScoreT *scores,
   return error < target_error;
 }
 
-#ifdef NUMA_PMEM
+
+
+#ifdef HASH_MODE
 int main(int argc, char* argv[]) {
   CLPageRank cli(argc, argv, "pagerank", 1e-4, 20);
   if (!cli.ParseArgs())
@@ -191,6 +283,7 @@ int main(int argc, char* argv[]) {
   WeightedBuilder b(cli);
   WGraph g = b.MakeGraph();
   std::function<ScoreT*(const WGraph&)> PRBound;
+  printf("Iters: %d\n", cli.max_iters());
 //  g.print_pma_meta();
 if(omp_get_max_threads() > 1){//Mais que um Thread, vira NUMA
   PRBound = [&cli] (const WGraph &g) {
@@ -217,7 +310,6 @@ int main(int argc, char* argv[]) {
     return -1;
   WeightedBuilder b(cli);
   WGraph g = b.MakeGraph();
-  printf("deu certo criar grafo\n");
 //  g.print_pma_meta();
   auto PRBound = [&cli] (const WGraph &g) {
     return PageRankPull(g, cli.max_iters(), cli.tolerance());

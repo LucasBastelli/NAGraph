@@ -371,44 +371,10 @@ pvector<NodeID> DOBFSNuma(const WGraph &g, NodeID source, int alpha = 15,
 // PrintStep("td", t.Seconds(), queue.size());
     }
   }
-  
-  // Adaptação do loop final para NUMA
-  #pragma omp parallel
-  {
-    // Bind uma única vez por thread
-    int tid = omp_get_thread_num();
-    int numThreads = omp_get_num_threads();
-    int node_count = 2;
-    
-    static const std::vector<int> node0_cpus = {
-      0,1,2,3,4,5,6,7,8,9,10,11,
-      24,25,26,27,28,29,30,31,32,33,34,35
-    };
-    static const std::vector<int> node1_cpus = {
-      12,13,14,15,16,17,18,19,20,21,22,23,
-      36,37,38,39,40,41,42,43,44,45,46,47
-    };
-    
-    int64_t start;
-    if ((tid % node_count) == 0) {
-      bind_current_thread_to_cpu_list(node0_cpus);
-      start = tid; // Pares
-    }
-    else {
-      bind_current_thread_to_cpu_list(node1_cpus);
-      start = tid; // Ímpares
-    }
-    
-    // Loop manual com stride
-    for (NodeID n = start; n < g.num_nodes(); n += numThreads) {
-      if (parent[n] < -1)
-        parent[n] = -1;
-    }
-    
-    // Sincronização final
-    #pragma omp barrier
-    
-  } // fim do parallel
+  #pragma omp parallel for
+  for (NodeID n = 0; n < g.num_nodes(); n++)
+    if (parent[n] < -1)
+      parent[n] = -1;
   
   return parent;
 }
@@ -536,6 +502,33 @@ bool BFSVerifier(const WGraph &g, NodeID source,
 }
 
 
+#ifdef HASH_MODE
+int main(int argc, char* argv[]) {
+  CLApp cli(argc, argv, "breadth-first search");
+  if (!cli.ParseArgs())
+    return -1;
+    
+  WeightedBuilder b(cli);
+  WGraph g = b.MakeGraph();
+  SourcePicker<WGraph> sp(g, cli.start_vertex());
+  using BFSFunc = std::function<pvector<NodeID>(const WGraph&)>;
+  BFSFunc BFSBound;
+  if (omp_get_max_threads() > 1) {
+    BFSBound = [&sp] (const WGraph &g) { return DOBFSNuma(g, sp.PickNext()); };
+    std::cout << "Running NUMA-aware BFS" << std::endl;
+  } else {
+    BFSBound = [&sp] (const WGraph &g) { return DOBFS(g, sp.PickNext()); };
+    std::cout << "Running standard BFS" << std::endl;
+  }
+  SourcePicker<WGraph> vsp(g, cli.start_vertex());
+  auto VerifierBound = [&vsp] (const WGraph &g, const pvector<NodeID> &parent) {
+    return BFSVerifier(g, vsp.PickNext(), parent);
+  };
+  BenchmarkKernel(cli, g, BFSBound, PrintBFSStats, VerifierBound);
+  return 0;
+}
+
+#else
 int main(int argc, char* argv[]) {
   CLApp cli(argc, argv, "breadth-first search");
   if (!cli.ParseArgs())
@@ -551,3 +544,4 @@ int main(int argc, char* argv[]) {
   BenchmarkKernel(cli, g, BFSBound, PrintBFSStats, VerifierBound);
   return 0;
 }
+#endif

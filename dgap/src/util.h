@@ -66,6 +66,8 @@ flush_clwb_nolog(const void *addr, size_t len)
 
 /* size of the pmem object pool -- 8 GB */
 #define DB_POOL_SIZE (((size_t)1) << 33)
+/* size of the pmem object pool -- 60 GB */
+//#define DB_POOL_SIZE ((size_t)60 * 1024 * 1024 * 1024)
 //#define DB_POOL_SIZE ((((size_t)1) << 39) + (((size_t)1) << 37))
 //#define DB_POOL_SIZE (((size_t)1) << 31)
 

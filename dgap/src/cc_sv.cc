@@ -215,7 +215,7 @@ bool CCVerifier(const WGraph &g, const pvector<NodeID> &comp) {
   return true;
 }
 
-#ifdef NUMA_PMEM
+#ifdef HASH_MODE
 int main(int argc, char* argv[]) {
   CLApp cli(argc, argv, "connected-components");
   if (!cli.ParseArgs())
