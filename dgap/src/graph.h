@@ -3672,42 +3672,88 @@ inline void rebalance_node_data(int node_id, int32_t start_vertex, int32_t end_v
 
 /// Move os dados das arestas para as novas posições, usando undo-logs para consistência.
 // Função principal otimizada com divisão por nó NUMA
-inline void rebalance_data_V1(int32_t start_vertex, int32_t end_vertex, int64_t* new_index, bool from_resize = false) {
-    
-    // Versão paralela que processa cada nó NUMA separadamente
-    #pragma omp parallel sections num_threads(2)
-    {
-        #pragma omp section
-        {
-            // Thread 0: processa apenas vértices pares (nó 0)
-            rebalance_node_data(0, start_vertex, end_vertex, new_index);
-        }
+inline void rebalance_data_V1(int32_t start_vertex, int32_t end_vertex, int64_t* new_index) {
+    // Itera de trás para frente para evitar sobrescrever dados antes que sejam movidos (especialmente em right-shifts).
+    for (int32_t jj = end_vertex - 1; jj >= start_vertex; --jj) {
         
-        #pragma omp section
-        {
-            // Thread 1: processa apenas vértices ímpares (nó 1)  
-            rebalance_node_data(1, start_vertex, end_vertex, new_index);
+        // 1. Determina em qual nó NUMA o vértice atual está e seleciona os arrays corretos.
+        bool is_node0 = (jj % 2 == 0);
+        int32_t local_jj = jj / 2;
+
+        auto& V = is_node0 ? vertices_0 : vertices_1;
+        auto& E = is_node0 ? edges_0 : edges_1;
+        
+        // O offset global é 0 para o nó 0. Para o nó 1, seu índice local 0 corresponde ao global 'elem_capacity0'.
+        int64_t node_edge_offset = is_node0 ? 0 : elem_capacity0;
+
+        int32_t total_degree = V[local_jj].degree;
+
+        // Se o vértice não tem arestas, apenas atualizamos seu ponteiro de índice e continuamos.
+        if (total_degree == 0) {
+            V[local_jj].index = new_index[jj - start_vertex];
+            continue;
         }
+
+        // 2. Coleta informações sobre as posições (antiga e nova) e as arestas no log.
+        int64_t old_global_pos = V[local_jj].index;
+        int64_t new_global_pos = new_index[jj - start_vertex];
+        
+        int64_t old_local_pos = old_global_pos - node_edge_offset;
+        int64_t new_local_pos = new_global_pos - node_edge_offset;
+
+        int log_count = 0;
+        // Calcula quantas arestas estão no log, se houver.
+        if (V[local_jj].offset != -1) {
+            int32_t global_seg_id = get_segment_id(jj) - segment_count;
+            bool seg_on_node0 = (global_seg_id < segment_count0);
+            int32_t local_seg_id = seg_on_node0 ? global_seg_id : global_seg_id - segment_count0;
+            auto& log_pointers = seg_on_node0 ? log_ptr_0 : log_ptr_1;
+            
+            int32_t curr_off = V[local_jj].offset;
+            while(curr_off != -1) {
+                log_count++;
+                curr_off = log_pointers[local_seg_id][curr_off].prev_offset;
+            }
+        }
+
+        // O número de arestas no array principal é o grau total menos o que está no log.
+        int on_segment_count = total_degree - log_count;
+
+        // 3. Move o bloco de arestas do array principal para a nova posição.
+        // Usamos memmove porque as áreas de memória de origem e destino podem se sobrepor.
+        if (on_segment_count > 0) {
+            memmove(&E[new_local_pos], &E[old_local_pos], on_segment_count * sizeof(DestID_));
+        }
+
+        // 4. Copia as arestas do log para o final do novo bloco.
+        if (log_count > 0) {
+            // A posição de escrita começa logo após as arestas que acabamos de mover.
+            int64_t write_pos = new_local_pos + on_segment_count;
+
+            int32_t global_seg_id = get_segment_id(jj) - segment_count;
+            bool seg_on_node0 = (global_seg_id < segment_count0);
+            int32_t local_seg_id = seg_on_node0 ? global_seg_id : global_seg_id - segment_count0;
+            auto& log_pointers = seg_on_node0 ? log_ptr_0 : log_ptr_1;
+
+            int32_t curr_off = V[local_jj].offset;
+            while (curr_off != -1) {
+                E[write_pos].v = log_pointers[local_seg_id][curr_off].v;
+                write_pos++;
+                curr_off = log_pointers[local_seg_id][curr_off].prev_offset;
+            }
+        }
+
+        // 5. Atualiza os metadados do vértice com a nova posição e limpa o ponteiro do log.
+        V[local_jj].index = new_global_pos;
+        V[local_jj].offset = -1; // O log foi consolidado, então resetamos o offset.
     }
-    
-    // Limpa logs de todos os segmentos afetados (uma vez só no final)
+
+    // 6. Limpa os logs para os segmentos que foram processados.
+    // Esta parte é a mesma da sua função original e está correta.
     int32_t st_seg = get_segment_id(start_vertex) - segment_count;
     int32_t nd_seg = get_segment_id(end_vertex - 1) - segment_count + 1;
-    
-    // Limpa logs do nó 0
-    #pragma omp parallel for
     for (int32_t seg_id = st_seg; seg_id < nd_seg; ++seg_id) {
-        if (seg_id < segment_count0) {
-            release_log(seg_id);
-        }
-    }
-    
-    // Limpa logs do nó 1  
-    #pragma omp parallel for
-    for (int32_t seg_id = st_seg; seg_id < nd_seg; ++seg_id) {
-        if (seg_id >= segment_count0) {
-            release_log(seg_id - segment_count0);
-        }
+        release_log(seg_id);
     }
 }
 
