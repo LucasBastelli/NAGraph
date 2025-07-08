@@ -319,7 +319,6 @@ class CSRGraph {
     if (segment_edges_total != nullptr) free(segment_edges_total);
   }
   #endif
-
 public:
   #ifdef NUMA_PMEM
   PMEMobjpool *pop0;
@@ -336,73 +335,81 @@ public:
 
   #ifdef NUMA_PMEM
   
-  ~CSRGraph() {
-    memcpy((struct vertex_element *) pmemobj_direct(bp0->vertices_oid_), vertices_0,
-    n_vertices_node0 * sizeof(struct vertex_element));
-    memcpy((struct vertex_element *) pmemobj_direct(bp1->vertices_oid_), vertices_1,
-    n_vertices_node1 * sizeof(struct vertex_element));
-    flush_clwb_nolog((struct vertex_element *) pmemobj_direct(bp0->vertices_oid_),
-    n_vertices_node0 * sizeof(struct vertex_element));
-    flush_clwb_nolog((struct vertex_element *) pmemobj_direct(bp1->vertices_oid_),
-    n_vertices_node1 * sizeof(struct vertex_element));                
+~CSRGraph() {
+    // Para persistir os dados dos vértices, que estão distribuidos por hash em memória
+    // (pares no nó 0, ímpares no nó 1), precisamos primeiro remontá-los em arrays
+    // contíguos temporários que correspondam ao layout da PMem.
+    auto temp_vertices_0 = (struct vertex_element*) numa_alloc_onnode(n_vertices_node0 * sizeof(struct vertex_element), 0);
+    auto temp_vertices_1 = (struct vertex_element*) numa_alloc_onnode(n_vertices_node1 * sizeof(struct vertex_element), 1);
 
-    //memcpy((int32_t *) pmemobj_direct(bp0->log_segment_idx_oid_), log_segment_idx_0, segment_count0 * sizeof(int32_t));
-    //memcpy((int32_t *) pmemobj_direct(bp1->log_segment_idx_oid_), log_segment_idx_1, segment_count1 * sizeof(int32_t));
+    // Itera sobre todos os vértices do grafo.
+    for (int32_t i = 0; i < num_vertices; ++i) {
+        bool is_node0 = (i % 2 == 0);
+        int32_t local_id = i / 2;
+
+        if (is_node0) {
+            // Se o vértice 'i' é par, seus dados estão em vertices_0.
+            // Copiamos para a posição correta no array temporário do nó 0.
+            if (local_id < n_vertices_node0) {
+                 temp_vertices_0[local_id] = vertices_0[local_id];
+            }
+        } else {
+            // Se o vértice 'i' é ímpar, seus dados estão em vertices_1.
+            // Copiamos para a posição correta no array temporário do nó 1.
+            if (local_id < n_vertices_node1) {
+                temp_vertices_1[local_id] = vertices_1[local_id];
+            }
+        }
+    }
+
+    // Agora que temos os dados ordenados nos arrays temporários, podemos copiá-los para a PMem.
+    memcpy((struct vertex_element *) pmemobj_direct(bp0->vertices_oid_), temp_vertices_0, n_vertices_node0 * sizeof(struct vertex_element));
+    flush_clwb_nolog((struct vertex_element *) pmemobj_direct(bp0->vertices_oid_), n_vertices_node0 * sizeof(struct vertex_element));
+
+    memcpy((struct vertex_element *) pmemobj_direct(bp1->vertices_oid_), temp_vertices_1, n_vertices_node1 * sizeof(struct vertex_element));
+    flush_clwb_nolog((struct vertex_element *) pmemobj_direct(bp1->vertices_oid_), n_vertices_node1 * sizeof(struct vertex_element));
+
+    // Libera a memória dos arrays temporários.
+    numa_free(temp_vertices_0, n_vertices_node0 * sizeof(struct vertex_element));
+    numa_free(temp_vertices_1, n_vertices_node1 * sizeof(struct vertex_element));
+
+    // Persiste os metadados dos logs e dos segmentos.
+    // Estes já estão particionados corretamente em memória.
+    memcpy((int32_t *) pmemobj_direct(bp0->log_segment_idx_oid_), log_segment_idx_0, segment_count0 * sizeof(int32_t));
     flush_clwb_nolog((int32_t *) pmemobj_direct(bp0->log_segment_idx_oid_), segment_count0 * sizeof(int32_t));
+    memcpy((int32_t *) pmemobj_direct(bp1->log_segment_idx_oid_), log_segment_idx_1, segment_count1 * sizeof(int32_t));
     flush_clwb_nolog((int32_t *) pmemobj_direct(bp1->log_segment_idx_oid_), segment_count1 * sizeof(int32_t));
-    
-    memcpy((int64_t *) pmemobj_direct(bp0->segment_edges_actual_oid_), segment_edges_actual_0,
-           sizeof(int64_t) * segment_count * 2);
-    memcpy((int64_t *) pmemobj_direct(bp1->segment_edges_actual_oid_), segment_edges_actual_1,
-           sizeof(int64_t) * segment_count * 2);
-    flush_clwb_nolog((int64_t *) pmemobj_direct(bp0->segment_edges_actual_oid_), sizeof(int64_t) * segment_count * 2);
-    flush_clwb_nolog((int64_t *) pmemobj_direct(bp1->segment_edges_actual_oid_), sizeof(int64_t) * segment_count * 2);
 
-    memcpy((int64_t *) pmemobj_direct(bp0->segment_edges_total_oid_), segment_edges_total,
-           sizeof(int64_t) * segment_count * 2);
-    memcpy((int64_t *) pmemobj_direct(bp1->segment_edges_total_oid_), segment_edges_total,
-           sizeof(int64_t) * segment_count * 2);
+    memcpy((int64_t *) pmemobj_direct(bp0->segment_edges_actual_oid_), segment_edges_actual_0, sizeof(int64_t) * segment_count0 * 2);
+    flush_clwb_nolog((int64_t *) pmemobj_direct(bp0->segment_edges_actual_oid_), sizeof(int64_t) * segment_count0 * 2);
+    memcpy((int64_t *) pmemobj_direct(bp1->segment_edges_actual_oid_), segment_edges_actual_1, sizeof(int64_t) * segment_count1 * 2);
+    flush_clwb_nolog((int64_t *) pmemobj_direct(bp1->segment_edges_actual_oid_), sizeof(int64_t) * segment_count1 * 2);
+
+    // 'segment_edges_total' é global, então salvamos a mesma cópia em ambos os nós.
+    memcpy((int64_t *) pmemobj_direct(bp0->segment_edges_total_oid_), segment_edges_total, sizeof(int64_t) * segment_count * 2);
     flush_clwb_nolog((int64_t *) pmemobj_direct(bp0->segment_edges_total_oid_), sizeof(int64_t) * segment_count * 2);
+    memcpy((int64_t *) pmemobj_direct(bp1->segment_edges_total_oid_), segment_edges_total, sizeof(int64_t) * segment_count * 2);
     flush_clwb_nolog((int64_t *) pmemobj_direct(bp1->segment_edges_total_oid_), sizeof(int64_t) * segment_count * 2);
-    
-    bp0->num_vertices = n_vertices_node0;  // Number of vertices
-    flush_clwb_nolog(&bp0->num_vertices, sizeof(int64_t));
-    bp1->num_vertices = n_vertices_node1;  // Number of vertices
-    flush_clwb_nolog(&bp1->num_vertices, sizeof(int64_t));
 
-    bp0->num_edges_ = n_edges_node0;  // Number of edges
-    flush_clwb_nolog(&bp0->num_edges_, sizeof(int64_t));
-    bp1->num_edges_ = n_edges_node1;  // Number of edges
-    flush_clwb_nolog(&bp1->num_edges_, sizeof(int64_t));
-
-    bp0->elem_capacity = elem_capacity;
-    flush_clwb_nolog(&bp0->elem_capacity, sizeof(int64_t));
-    bp1->elem_capacity = elem_capacity;
-    flush_clwb_nolog(&bp1->elem_capacity, sizeof(int64_t));
-
+    // Persiste os metadados gerais do grafo para cada nó.
+    bp0->num_vertices = n_vertices_node0;
+    bp1->num_vertices = n_vertices_node1;
+    bp0->num_edges_ = n_edges_node0;
+    bp1->num_edges_ = n_edges_node1;
+    bp0->elem_capacity = elem_capacity0;
+    bp1->elem_capacity = elem_capacity1;
     bp0->segment_count = segment_count0;
-    flush_clwb_nolog(&bp0->segment_count, sizeof(int64_t));
     bp1->segment_count = segment_count1;
-    flush_clwb_nolog(&bp1->segment_count, sizeof(int64_t));
-
-    bp0->segment_size = segment_size;
-    flush_clwb_nolog(&bp0->segment_size, sizeof(int64_t));
-    bp1->segment_size = segment_size;
-    flush_clwb_nolog(&bp1->segment_size, sizeof(int64_t));
-
-    bp0->tree_height = tree_height;
-    flush_clwb_nolog(&bp0->tree_height, sizeof(int64_t));
-    bp1->tree_height = tree_height;
-    flush_clwb_nolog(&bp1->tree_height, sizeof(int64_t));
-
-    // write flag indicating data has been backed up properly before shutting down
-    bp0->backed_up_ = true;
-    flush_clwb_nolog(&bp0->backed_up_, sizeof(bool));
+    bp0->backed_up_ = true; // Sinaliza que o backup foi bem-sucedido.
     bp1->backed_up_ = true;
-    flush_clwb_nolog(&bp1->backed_up_, sizeof(bool));
 
-    ReleaseResources();
-  }
+    // Persiste todas as alterações no objeto base.
+    flush_clwb_nolog(bp0, sizeof(struct Base));
+    flush_clwb_nolog(bp1, sizeof(struct Base));
+
+    ReleaseResources(); // Libera recursos da DRAM.
+}
+
   #else
   ~CSRGraph() {
     memcpy((struct vertex_element *) pmemobj_direct(bp->vertices_oid_), vertices_,
@@ -447,52 +454,46 @@ public:
   }
   #endif
   
-  #ifdef NUMA_PMEM
-  CSRGraph(const char *file0, const char *file1, const EdgeList &edge_list, bool is_directed, int64_t n_edges, int64_t n_vertices) {
     
+  #ifdef NUMA_PMEM
+CSRGraph(const char *file0, const char *file1, const EdgeList &edge_list, bool is_directed, int64_t n_edges, int64_t n_vertices) {
     bool is_new = false;
-    //node_counter = numa_num_configured_nodes();
-    node_counter = 2;
-    num_threads = omp_get_max_threads(); //Talvez dividir por 2?
-    printf("File 0: %s \nFile 1: %s\n", file0,file1);
-    /* file1 already exists */
-    if((file_exists(file0)!= 0) || (file_exists(file1)!= 0)){ 
-        //If one of the files does not exist, it delete the other and create new ones.
-        if (file_exists(file0) == 0) {
-            delete_file(file0);
-        }
-        if (file_exists(file1) == 0) {
-            delete_file(file1);
-        is_new = true;
-        }
-    }
-    if (file_exists(file0) == 0) {
-      if ((pop0 = pmemobj_open(file0, LAYOUT_NAME)) == NULL) {
-        fprintf(stderr, "[%s]: FATAL: pmemobj_open error: %s\n", __FUNCTION__, pmemobj_errormsg());
-        exit(0);
-      }
-    } else {
-      if ((pop0 = pmemobj_create(file0, LAYOUT_NAME, DB_POOL_SIZE, CREATE_MODE_RW)) == NULL) {
-        fprintf(stderr, "[%s]: FATAL: pmemobj_create error: %s\n", __FUNCTION__, pmemobj_errormsg());
-        exit(0);
-      }
-      is_new = true;
+    node_counter = 2; // Hard-coded para 2 nós NUMA
+    num_threads = omp_get_max_threads();
+    printf("File 0: %s \nFile 1: %s\n", file0, file1);
+
+    // Lógica para abrir ou criar os arquivos de pool de memória persistente
+    if (file_exists(file0) != 0 || file_exists(file1) != 0) {
+        if (access(file0, F_OK) == 0 && access(file1, F_OK) != 0) remove(file0);
+        if (access(file0, F_OK) != 0 && access(file1, F_OK) == 0) remove(file1);
     }
 
-    if (file_exists(file1) == 0) {
-        if ((pop1 = pmemobj_open(file1, LAYOUT_NAME)) == NULL) {
-          fprintf(stderr, "[%s]: FATAL: pmemobj_open error: %s\n", __FUNCTION__, pmemobj_errormsg());
-          exit(0);
-        }
-      } else {
-        if ((pop1 = pmemobj_create(file1, LAYOUT_NAME, DB_POOL_SIZE, CREATE_MODE_RW)) == NULL) {
-          fprintf(stderr, "[%s]: FATAL: pmemobj_create error: %s\n", __FUNCTION__, pmemobj_errormsg());
-          exit(0);
+    if (access(file0, F_OK) != 0) {
+        if ((pop0 = pmemobj_create(file0, LAYOUT_NAME, DB_POOL_SIZE, CREATE_MODE_RW)) == NULL) {
+            fprintf(stderr, "[%s]: FATAL: pmemobj_create (file0) error: %s\n", __FUNCTION__, pmemobj_errormsg());
+            exit(1);
         }
         is_new = true;
+    } else {
+        if ((pop0 = pmemobj_open(file0, LAYOUT_NAME)) == NULL) {
+            fprintf(stderr, "[%s]: FATAL: pmemobj_open (file0) error: %s\n", __FUNCTION__, pmemobj_errormsg());
+            exit(1);
+        }
+    }
+
+    if (access(file1, F_OK) != 0) {
+        if ((pop1 = pmemobj_create(file1, LAYOUT_NAME, DB_POOL_SIZE, CREATE_MODE_RW)) == NULL) {
+            fprintf(stderr, "[%s]: FATAL: pmemobj_create (file1) error: %s\n", __FUNCTION__, pmemobj_errormsg());
+            exit(1);
+        }
+        is_new = true;
+    } else {
+        if ((pop1 = pmemobj_open(file1, LAYOUT_NAME)) == NULL) {
+            fprintf(stderr, "[%s]: FATAL: pmemobj_open (file1) error: %s\n", __FUNCTION__, pmemobj_errormsg());
+            exit(1);
+        }
     }
     
-    //One for each NUMA node
     base_oid0 = pmemobj_root(pop0, sizeof(struct Base));
     bp0 = (struct Base *) pmemobj_direct(base_oid0);
     check_sanity(bp0);
@@ -501,303 +502,253 @@ public:
     bp1 = (struct Base *) pmemobj_direct(base_oid1);
     check_sanity(bp1);
 
-    // newly created files
+    int num_threads_node0 = num_threads / 2;
+    int num_threads_node1 = num_threads - num_threads_node0;
+    if(num_threads_node0 < 1) {
+        num_threads_node0 = 1;
+        num_threads_node1 = 1;
+    }
+
     if (is_new) {
-      // ds initialization (for dram-domain)
+      // --- CAMINHO PARA UM GRAFO NOVO ---
       num_edges_ = n_edges;
-      printf("Num edges: %ld\n", num_edges_);
       num_vertices = n_vertices;
       max_valid_vertex_id = n_vertices;
       directed_ = is_directed;
       compute_capacity();
+
       n_vertices_node0 = num_vertices / 2;
       n_vertices_node1 = num_vertices - n_vertices_node0;
-      n_edges_node0 = n_edges / 2;     // Exemplo: partição igual para as aresta
-      n_edges_node1 = n_edges - n_edges_node0;
-      elem_capacity0 = elem_capacity /2;
+      
+      elem_capacity0 = elem_capacity / 2;
       elem_capacity1 = elem_capacity - elem_capacity0;
-      segment_count0 = segment_count/2; //Depois do compute_capacity
+      segment_count0 = segment_count / 2;
       segment_count1 = segment_count - segment_count0;
-      // array-based compete tree structure
+
       segment_edges_actual_0 = (int64_t *) calloc(segment_count0 * 2, sizeof(int64_t));
       segment_edges_actual_1 = (int64_t *) calloc(segment_count1 * 2, sizeof(int64_t));
       segment_edges_total = (int64_t *) calloc(segment_count * 2, sizeof(int64_t));
-
+      
       tree_height = floor_log2(segment_count);
       delta_up = (up_0 - up_h) / tree_height;
       delta_low = (low_h - low_0) / tree_height;
 
-      // ds initialization (for pmem-domain)
+      // Inicialização dos metadados na PMem para o nó 0
       bp0->pool_uuid_lo = base_oid0.pool_uuid_lo;
       bp0->num_vertices = n_vertices_node0;
-      bp0->num_edges_ = n_edges_node0;
+      bp0->num_edges_ = 0; // Começa com 0 arestas, serão inseridas depois
       bp0->directed_ = directed_;
-      bp0->elem_capacity = elem_capacity;
+      bp0->elem_capacity = elem_capacity0;
       bp0->segment_count = segment_count0;
       bp0->segment_size = segment_size;
       bp0->tree_height = tree_height;
 
+      // Inicialização dos metadados na PMem para o nó 1
       bp1->pool_uuid_lo = base_oid1.pool_uuid_lo;
       bp1->num_vertices = n_vertices_node1;
-      bp1->num_edges_ = n_edges_node1;
+      bp1->num_edges_ = 0;
       bp1->directed_ = directed_;
-      bp1->elem_capacity = elem_capacity;
+      bp1->elem_capacity = elem_capacity1;
       bp1->segment_count = segment_count1;
       bp1->segment_size = segment_size;
       bp1->tree_height = tree_height;
-      // allocate memory for vertices and edges in pmem-domain
-      // shouldn't the vertex array be volatile? - OTAVIO
-      if (pmemobj_zalloc(pop0, &bp0->vertices_oid_, n_vertices_node0 * sizeof(struct vertex_element), VERTEX_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: vertex array allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
-      if (pmemobj_zalloc(pop1, &bp1->vertices_oid_, n_vertices_node1 * sizeof(struct vertex_element), VERTEX_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: vertex array allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
 
-      if (pmemobj_zalloc(pop0, &bp0->edges_oid_, elem_capacity0 * sizeof(DestID_), EDGE_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: edge array allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
-      if (pmemobj_zalloc(pop1, &bp1->edges_oid_, elem_capacity1 * sizeof(DestID_), EDGE_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: edge array allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
+      // Alocação de memória na PMem para cada nó
+      if (pmemobj_zalloc(pop0, &bp0->vertices_oid_, n_vertices_node0 * sizeof(struct vertex_element), VERTEX_TYPE)) abort();
+      if (pmemobj_zalloc(pop1, &bp1->vertices_oid_, n_vertices_node1 * sizeof(struct vertex_element), VERTEX_TYPE)) abort();
+      if (pmemobj_zalloc(pop0, &bp0->edges_oid_, elem_capacity0 * sizeof(DestID_), EDGE_TYPE)) abort();
+      if (pmemobj_zalloc(pop1, &bp1->edges_oid_, elem_capacity1 * sizeof(DestID_), EDGE_TYPE)) abort();
+      if (pmemobj_zalloc(pop0, &bp0->log_segment_oid_, segment_count0 * MAX_LOG_ENTRIES * sizeof(struct LogEntry), SEG_LOG_PTR_TYPE)) abort();
+      if (pmemobj_zalloc(pop1, &bp1->log_segment_oid_, segment_count1 * MAX_LOG_ENTRIES * sizeof(struct LogEntry), SEG_LOG_PTR_TYPE)) abort();
+      if (pmemobj_zalloc(pop0, &bp0->log_segment_idx_oid_, segment_count0 * sizeof(int32_t), SEG_LOG_IDX_TYPE)) abort();
+      if (pmemobj_zalloc(pop1, &bp1->log_segment_idx_oid_, segment_count1 * sizeof(int32_t), SEG_LOG_IDX_TYPE)) abort();
 
-      // conteudo dos per-section edge logs - OTAVIO
-      if (pmemobj_zalloc(pop0, &bp0->log_segment_oid_, segment_count0 * MAX_LOG_ENTRIES * sizeof(struct LogEntry),
-                         SEG_LOG_PTR_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: per-segment log array allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
+      // EXPLICAÇÃO: O número de threads também deve ser dividido.
+      // Assumindo que metade das threads trabalhará em cada nó.
+      int num_threads_node0 = num_threads / 2;
+      int num_threads_node1 = num_threads - num_threads_node0;
+      if(num_threads_node0 < 1){
+        num_threads_node0 = 1;
+        num_threads_node1 = 1;
       }
-      
-      if (pmemobj_zalloc(pop1, &bp1->log_segment_oid_, segment_count1 * MAX_LOG_ENTRIES * sizeof(struct LogEntry),
-                         SEG_LOG_PTR_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: per-segment log array allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
+      if (pmemobj_zalloc(pop0, &bp0->ulog_oid_, num_threads_node0 * MAX_ULOG_ENTRIES * sizeof(DestID_), ULOG_PTR_TYPE)) abort();
+      if (pmemobj_zalloc(pop1, &bp1->ulog_oid_, num_threads_node1 * MAX_ULOG_ENTRIES * sizeof(DestID_), ULOG_PTR_TYPE)) abort();
+      if (pmemobj_zalloc(pop0, &bp0->oplog_oid_, num_threads_node0 * sizeof(int64_t), OPLOG_PTR_TYPE)) abort();
+      if (pmemobj_zalloc(pop1, &bp1->oplog_oid_, num_threads_node1 * sizeof(int64_t), OPLOG_PTR_TYPE)) abort();
 
-      if (pmemobj_zalloc(pop0, &bp0->log_segment_idx_oid_, segment_count0 * sizeof(int32_t), SEG_LOG_IDX_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: per-segment log index allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
-      
-
-      if (pmemobj_zalloc(pop1, &bp1->log_segment_idx_oid_, segment_count1 * sizeof(int32_t), SEG_LOG_IDX_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: per-segment log index allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
-
-
-
-
-      if (pmemobj_zalloc(pop0, &bp0->ulog_oid_, num_threads * MAX_ULOG_ENTRIES * sizeof(DestID_), ULOG_PTR_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: u-log array allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
-
-      if (pmemobj_zalloc(pop1, &bp1->ulog_oid_, num_threads * MAX_ULOG_ENTRIES * sizeof(DestID_), ULOG_PTR_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: u-log array allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
-
-      // ??? - OTAVIO
-      if (pmemobj_zalloc(pop0, &bp0->oplog_oid_, num_threads * sizeof(int64_t), OPLOG_PTR_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: op-log array allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
-      if (pmemobj_zalloc(pop1, &bp1->oplog_oid_, num_threads * sizeof(int64_t), OPLOG_PTR_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: op-log array allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
-
-
-
-      // por que diabos ele está alocando duas vezes a mesma coisa??? - OTAVIO
-      if (pmemobj_zalloc(pop0, &bp0->segment_edges_actual_oid_, sizeof(int64_t) * segment_count0 * 2,
-                         PMA_TREE_META_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: pma metadata allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
-      if (pmemobj_zalloc(pop1, &bp1->segment_edges_actual_oid_, sizeof(int64_t) * segment_count1 * 2,
-            PMA_TREE_META_TYPE)) {
-      fprintf(stderr, "[%s]: FATAL: pma metadata allocation failed: %s\n", __func__, pmemobj_errormsg());
-      abort();
-      }
-
-      if (pmemobj_zalloc(pop0, &bp0->segment_edges_total_oid_, sizeof(int64_t) * segment_count0 * 2, PMA_TREE_META_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: pma metadata allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
-      if (pmemobj_zalloc(pop1, &bp1->segment_edges_total_oid_, sizeof(int64_t) * segment_count1 * 2, PMA_TREE_META_TYPE)) {
-        fprintf(stderr, "[%s]: FATAL: pma metadata allocation failed: %s\n", __func__, pmemobj_errormsg());
-        abort();
-      }
+      // EXPLICAÇÃO para a dúvida "por que diabos ele está alocando duas vezes a mesma coisa???":
+      // O código não está alocando a mesma coisa duas vezes. Primeiro, ele aloca com `calloc` na DRAM (`segment_edges_actual_0`).
+      // Depois, aloca com `pmemobj_zalloc` na PMem (`bp0->segment_edges_actual_oid_`).
+      // A versão em DRAM é a cópia de trabalho, rápida, e a versão em PMem é o backup persistente.
+      if (pmemobj_zalloc(pop0, &bp0->segment_edges_actual_oid_, sizeof(int64_t) * segment_count0 * 2, PMA_TREE_META_TYPE)) abort();
+      if (pmemobj_zalloc(pop1, &bp1->segment_edges_actual_oid_, sizeof(int64_t) * segment_count1 * 2, PMA_TREE_META_TYPE)) abort();
+      if (pmemobj_zalloc(pop0, &bp0->segment_edges_total_oid_, sizeof(int64_t) * segment_count * 2, PMA_TREE_META_TYPE)) abort();
+      if (pmemobj_zalloc(pop1, &bp1->segment_edges_total_oid_, sizeof(int64_t) * segment_count * 2, PMA_TREE_META_TYPE)) abort();
 
       flush_clwb_nolog(bp0, sizeof(struct Base));
       flush_clwb_nolog(bp1, sizeof(struct Base));
-      // retrieving pmem-pointer from pmem-oid (for pmem domain)
-
-      //Como dividir em dois
-      //edges_ = (DestID_ *) pmemobj_direct(bp->edges_oid_);
+      
+      // Obtenção dos ponteiros diretos para a PMem
       edges_0 = (DestID_ *) pmemobj_direct(bp0->edges_oid_);
       edges_1 = (DestID_ *) pmemobj_direct(bp1->edges_oid_);
-      //vertices_0 = (struct vertex_element *) malloc(n_vertices_node0 * sizeof(struct vertex_element));
-      vertices_0 = (vertex_element*)numa_alloc_onnode(n_vertices_node0 * sizeof(vertex_element),/* node */ 0); //Alocando no nó 0
+      
+      vertices_0 = (vertex_element*)numa_alloc_onnode(n_vertices_node0 * sizeof(vertex_element), 0);
       memcpy(vertices_0, (struct vertex_element *) pmemobj_direct(bp0->vertices_oid_), n_vertices_node0 * sizeof(struct vertex_element));
-
-      vertices_1 = (vertex_element*)numa_alloc_onnode(n_vertices_node1 * sizeof(vertex_element), /* node */ 1);
-      //vertices_1 = (struct vertex_element *) malloc(n_vertices_node1 * sizeof(struct vertex_element));
+      vertices_1 = (vertex_element*)numa_alloc_onnode(n_vertices_node1 * sizeof(vertex_element), 1);
       memcpy(vertices_1, (struct vertex_element *) pmemobj_direct(bp1->vertices_oid_), n_vertices_node1 * sizeof(struct vertex_element));
-      /*
-      struct LogEntry *log_base_ptr_0;
-      struct LogEntry *log_base_ptr_1;
-      struct LogEntry **log_ptr_0;
-      struct LogEntry **log_ptr_1;
-      DestID_ *ulog_base_ptr_0;
-      DestID_ *ulog_base_ptr_1;
-      DestID_ **ulog_ptr_0;
-      DestID_ **ulog_ptr_1;
-      */
-      log_base_ptr_ = (struct LogEntry *) pmemobj_direct(bp0->log_segment_oid_);
-      log_ptr_ = (struct LogEntry **) malloc(segment_count * 2 * sizeof(struct LogEntry *));  // 8-byte
-
-      // save pointer in the log_ptr_[sid]
-      for (int sid = 0; sid < (segment_count * 2); sid += 1) {
-        log_ptr_[sid] = (struct LogEntry *) (log_base_ptr_ + (sid * MAX_LOG_ENTRIES));
-      }
-      log_segment_idx_ = (int32_t *) calloc(segment_count, sizeof(int32_t));
-
-      ulog_base_ptr_ = (DestID_ *) pmemobj_direct(bp0->ulog_oid_);
-      ulog_ptr_ = (DestID_ **) malloc(num_threads * sizeof(DestID_ *)); // 8-byte
-
-      // save pointer in the ulog_ptr_[tid]
-      for (int tid = 0; tid < num_threads; tid += 1) {
-        /// assignment of per-seg-edge-log from a single large pre-allocated log
-        ulog_ptr_[tid] = (DestID_ *) (ulog_base_ptr_ + (tid * MAX_ULOG_ENTRIES));
-      }
-
-      oplog_ptr_ = (int64_t *) pmemobj_direct(bp0->oplog_oid_);
-      for(int i = 0;i<(segment_count * 2); i++){
-        for(int j = 0;j<(segment_count * 2); j++){
-          //printf("Index do log_ptr: %d\n", log_ptr_[i][j].prev_offset);
-          log_ptr_[i][j].prev_offset = -1;
-        }
-      }
-
-      /*
+      
+      // Inicialização dos logs de segmento
       log_base_ptr_0 = (struct LogEntry *) pmemobj_direct(bp0->log_segment_oid_);
-      log_ptr_0 = (struct LogEntry **) malloc(segment_count0 * sizeof(struct LogEntry *));
-      for (int sid = 0; sid < segment_count0; sid++) {
-        log_ptr_0[sid] = log_base_ptr_0 + (sid * MAX_LOG_ENTRIES);
-      }
-      log_segment_idx_0 = (int32_t *) calloc(segment_count0, sizeof(int32_t));
+      log_ptr_0 = (struct LogEntry **) numa_alloc_onnode(segment_count0 * sizeof(struct LogEntry *), 0);
+      for (int sid = 0; sid < segment_count0; sid++) { log_ptr_0[sid] = log_base_ptr_0 + (sid * MAX_LOG_ENTRIES); }
+      log_segment_idx_0 = (int32_t *) numa_alloc_onnode(segment_count0 * sizeof(int32_t), 0);
+      memset(log_segment_idx_0, 0, segment_count0 * sizeof(int32_t));
 
       log_base_ptr_1 = (struct LogEntry *) pmemobj_direct(bp1->log_segment_oid_);
-      log_ptr_1 = (struct LogEntry **) malloc(segment_count1 * sizeof(struct LogEntry *));
-      for (int sid = 0; sid < segment_count1; sid++) {
-        log_ptr_1[sid] = log_base_ptr_1 + (sid * MAX_LOG_ENTRIES);
-      }
-      log_segment_idx_1 = (int32_t *) calloc(segment_count1, sizeof(int32_t));
+      log_ptr_1 = (struct LogEntry **) numa_alloc_onnode(segment_count1 * sizeof(struct LogEntry *), 1);
+      for (int sid = 0; sid < segment_count1; sid++) { log_ptr_1[sid] = log_base_ptr_1 + (sid * MAX_LOG_ENTRIES); }
+      log_segment_idx_1 = (int32_t *) numa_alloc_onnode(segment_count1 * sizeof(int32_t), 1);
+      memset(log_segment_idx_1, 0, segment_count1 * sizeof(int32_t));
 
+      // Inicialização dos undo-logs (ulog) e operation-logs (oplog)
       ulog_base_ptr_0 = (DestID_ *) pmemobj_direct(bp0->ulog_oid_);
-      ulog_ptr_0 = (DestID_ **) malloc((num_threads/2) * sizeof(DestID_ *));
-
-      ulog_base_ptr_1 = (DestID_ *) pmemobj_direct(bp1->ulog_oid_);
-      ulog_ptr_1 = (DestID_ **) malloc((num_threads/2) * sizeof(DestID_ *));
-
-      // Para o nó NUMA 0:
-      ulog_base_ptr_0 = (DestID_ *) pmemobj_direct(bp0->ulog_oid_);
-      ulog_ptr_0 = (DestID_ **) malloc((num_threads/2) * sizeof(DestID_ *));
-      for (int tid = 0; tid < (num_threads/2); tid++) {
-          ulog_ptr_0[tid] = ulog_base_ptr_0 + (tid * MAX_ULOG_ENTRIES);
-      }
+      ulog_ptr_0 = (DestID_ **) numa_alloc_onnode(num_threads_node0 * sizeof(DestID_ *), 0);
+      for (int tid = 0; tid < num_threads_node0; tid++) { ulog_ptr_0[tid] = ulog_base_ptr_0 + (tid * MAX_ULOG_ENTRIES); }
       oplog_ptr_0 = (int64_t *) pmemobj_direct(bp0->oplog_oid_);
 
-      // Para o nó NUMA 1:
       ulog_base_ptr_1 = (DestID_ *) pmemobj_direct(bp1->ulog_oid_);
-      ulog_ptr_1 = (DestID_ **) malloc((num_threads/2) * sizeof(DestID_ *));
-      for (int tid = 0; tid < (num_threads/2); tid++) {
-          ulog_ptr_1[tid] = ulog_base_ptr_1 + (tid * MAX_ULOG_ENTRIES);
-      }     
+      ulog_ptr_1 = (DestID_ **) numa_alloc_onnode(num_threads_node1 * sizeof(DestID_ *), 1);
+      for (int tid = 0; tid < num_threads_node1; tid++) { ulog_ptr_1[tid] = ulog_base_ptr_1 + (tid * MAX_ULOG_ENTRIES); }
       oplog_ptr_1 = (int64_t *) pmemobj_direct(bp1->oplog_oid_);
-      */
-      // leaf segment concurrency primitives
+      
       leaf_segments = new PMALeafSegment[segment_count];
-      /// insert base-graph edges
+
+
+      // Inserção das arestas iniciais
       Timer t;
       t.Start();
-      insert(edge_list); // return later - OTAVIO
+      insert(edge_list); // Esta função precisará ser ciente da partição NUMA
       t.Stop();
       cout << "base graph insert time: " << t.Seconds() << endl;
+      
+      // Atualiza o número de arestas após a inserção
+      bp0->num_edges_ = n_edges_node0;
+      bp1->num_edges_ = n_edges_node1;
+      flush_clwb_nolog(&bp0->num_edges_, sizeof(int64_t));
+      flush_clwb_nolog(&bp1->num_edges_, sizeof(int64_t));
+
 
       bp0->backed_up_ = false;
       bp1->backed_up_ = false;
       flush_clwb_nolog(&bp0->backed_up_, sizeof(bool));
       flush_clwb_nolog(&bp1->backed_up_, sizeof(bool));
-    } /*else {
+    } else {
       Timer t_reboot;
       t_reboot.Start();
 
-      cout << "how was last backup? Good? " << bp->backed_up_ << endl;
+      cout << "Rebooting from existing files..." << endl;
+      cout << "Node 0 last backup OK? " << bp0->backed_up_ << endl;
+      cout << "Node 1 last backup OK? " << bp1->backed_up_ << endl;
 
-      /// ds initialization (for dram-domain)
-      elem_capacity = bp->elem_capacity;
-      segment_count = bp->segment_count;
-      segment_size = bp->segment_size;
-      tree_height = bp->tree_height;
-
-      num_vertices = bp->num_vertices;
-      num_edges_ = bp->num_edges_;
-      avg_degree = ceil_div(num_edges_, num_vertices);
-      directed_ = bp->directed_;
-
-      // array-based compete tree structure
-      segment_edges_actual = (int64_t *) calloc(segment_count * 2, sizeof(int64_t));
-      segment_edges_total = (int64_t *) calloc(segment_count * 2, sizeof(int64_t));
+      // Carrega metadados da PMem para a DRAM
+      directed_ = bp0->directed_; // Assume que é o mesmo para ambos
+      tree_height = bp0->tree_height;
+      segment_size = bp0->segment_size;
+      
+      // Agrega metadados dos dois nós
+      n_vertices_node0 = bp0->num_vertices;
+      n_vertices_node1 = bp1->num_vertices;
+      num_vertices = n_vertices_node0 + n_vertices_node1;
+      
+      n_edges_node0 = bp0->num_edges_;
+      n_edges_node1 = bp1->num_edges_;
+      num_edges_ = n_edges_node0 + n_edges_node1;
+      
+      elem_capacity0 = bp0->elem_capacity;
+      elem_capacity1 = bp1->elem_capacity;
+      elem_capacity = elem_capacity0 + elem_capacity1;
+      
+      segment_count0 = bp0->segment_count;
+      segment_count1 = bp1->segment_count;
+      segment_count = segment_count0 + segment_count1;
+      
+      // Aloca e inicializa estruturas em DRAM
+      segment_edges_actual_0 = (int64_t *) numa_alloc_onnode(segment_count0 * 2 * sizeof(int64_t), 0);
+      segment_edges_actual_1 = (int64_t *) numa_alloc_onnode(segment_count1 * 2 * sizeof(int64_t), 1);
+      segment_edges_total = (int64_t *) numa_alloc_onnode(segment_count * 2 * sizeof(int64_t), 0); // Pode ser em qualquer nó
 
       delta_up = (up_0 - up_h) / tree_height;
       delta_low = (low_h - low_0) / tree_height;
+      
+      // Obtém ponteiros para as regiões de PMem
+      edges_0 = (DestID_ *) pmemobj_direct(bp0->edges_oid_);
+      edges_1 = (DestID_ *) pmemobj_direct(bp1->edges_oid_);
+      
+      // Aloca memória em DRAM para os vértices em nós específicos
+      vertices_0 = (struct vertex_element *) numa_alloc_onnode(n_vertices_node0 * sizeof(struct vertex_element), 0);
+      vertices_1 = (struct vertex_element *) numa_alloc_onnode(n_vertices_node1 * sizeof(struct vertex_element), 1);
+      
+      // Inicializa os ponteiros de log de segmento em DRAM
+      log_base_ptr_0 = (struct LogEntry *) pmemobj_direct(bp0->log_segment_oid_);
+      log_ptr_0 = (struct LogEntry **) numa_alloc_onnode(segment_count0 * sizeof(struct LogEntry *), 0);
+      for (int sid = 0; sid < segment_count0; sid++) { log_ptr_0[sid] = log_base_ptr_0 + (sid * MAX_LOG_ENTRIES); }
+      log_segment_idx_0 = (int32_t *) numa_alloc_onnode(segment_count0 * sizeof(int32_t), 0);
 
-      // retrieving pmem-pointer from pmem-oid (for pmem domain)
-      edges_ = (DestID_ *) pmemobj_direct(bp->edges_oid_);
-      vertices_ = (struct vertex_element *) malloc(num_vertices * sizeof(struct vertex_element));
+      log_base_ptr_1 = (struct LogEntry *) pmemobj_direct(bp1->log_segment_oid_);
+      log_ptr_1 = (struct LogEntry **) numa_alloc_onnode(segment_count1 * sizeof(struct LogEntry *), 1);
+      for (int sid = 0; sid < segment_count1; sid++) { log_ptr_1[sid] = log_base_ptr_1 + (sid * MAX_LOG_ENTRIES); }
+      log_segment_idx_1 = (int32_t *) numa_alloc_onnode(segment_count1 * sizeof(int32_t), 1);
 
-      log_base_ptr_ = (struct LogEntry *) pmemobj_direct(bp->log_segment_oid_);
-      log_ptr_ = (struct LogEntry **) malloc(segment_count * sizeof(struct LogEntry *));  // 8-byte
-      log_segment_idx_ = (int32_t *) malloc(segment_count * sizeof(int32_t)); // 4-byte
+      // Inicialização dos undo-logs (ulog) e operation-logs (oplog) em DRAM
+      ulog_base_ptr_0 = (DestID_ *) pmemobj_direct(bp0->ulog_oid_);
+      ulog_ptr_0 = (DestID_ **) numa_alloc_onnode(num_threads_node0 * sizeof(DestID_ *), 0);
+      for (int tid = 0; tid < num_threads_node0; tid++) { ulog_ptr_0[tid] = ulog_base_ptr_0 + (tid * MAX_ULOG_ENTRIES); }
+      oplog_ptr_0 = (int64_t *) pmemobj_direct(bp0->oplog_oid_);
 
-      for (int sid = 0; sid < segment_count; sid += 1) {
-        // save pointer in the log_ptr_[sid]
-        log_ptr_[sid] = (struct LogEntry *) (log_base_ptr_ + (sid * MAX_LOG_ENTRIES));
-      }
+      ulog_base_ptr_1 = (DestID_ *) pmemobj_direct(bp1->ulog_oid_);
+      ulog_ptr_1 = (DestID_ **) numa_alloc_onnode(num_threads_node1 * sizeof(DestID_ *), 1);
+      for (int tid = 0; tid < num_threads_node1; tid++) { ulog_ptr_1[tid] = ulog_base_ptr_1 + (tid * MAX_ULOG_ENTRIES); }
+      oplog_ptr_1 = (int64_t *) pmemobj_direct(bp1->oplog_oid_);
+      
+      // Inicializa as primitivas de concorrência
+      leaf_segments = new PMALeafSegment[segment_count];
+      
+      // Verifica se o último desligamento foi correto
+      if (bp0->backed_up_ && bp1->backed_up_) {
+        cout << "Last shutdown was clean. Loading data from PMem." << endl;
+        // Copia os dados da PMem de volta para a DRAM
+        memcpy(vertices_0, (struct vertex_element *) pmemobj_direct(bp0->vertices_oid_), n_vertices_node0 * sizeof(struct vertex_element));
+        memcpy(vertices_1, (struct vertex_element *) pmemobj_direct(bp1->vertices_oid_), n_vertices_node1 * sizeof(struct vertex_element));
+        
+        memcpy(log_segment_idx_0, (int32_t *) pmemobj_direct(bp0->log_segment_idx_oid_), segment_count0 * sizeof(int32_t));
+        memcpy(log_segment_idx_1, (int32_t *) pmemobj_direct(bp1->log_segment_idx_oid_), segment_count1 * sizeof(int32_t));
+        
+        memcpy(segment_edges_actual_0, (int64_t *) pmemobj_direct(bp0->segment_edges_actual_oid_), sizeof(int64_t) * segment_count0 * 2);
+        memcpy(segment_edges_actual_1, (int64_t *) pmemobj_direct(bp1->segment_edges_actual_oid_), sizeof(int64_t) * segment_count1 * 2);
+        
+        // O array segment_edges_total é global, então podemos carregar de qualquer um dos nós (usando bp0 aqui)
+        memcpy(segment_edges_total, (int64_t *) pmemobj_direct(bp0->segment_edges_total_oid_), sizeof(int64_t) * segment_count * 2);
 
-      // last shutdown was properly backed up
-      if (bp->backed_up_) {
-        memcpy(vertices_, (struct vertex_element *) pmemobj_direct(bp->vertices_oid_),
-               num_vertices * sizeof(struct vertex_element));
-        memcpy(log_segment_idx_, (int32_t *) pmemobj_direct(bp->log_segment_idx_oid_),
-               segment_count * sizeof(int32_t));  // 4-byte
-        memcpy(segment_edges_actual, (int64_t *) pmemobj_direct(bp->segment_edges_actual_oid_),
-               sizeof(int64_t) * segment_count * 2); // 8-byte
-        memcpy(segment_edges_total, (int64_t *) pmemobj_direct(bp->segment_edges_total_oid_),
-               sizeof(int64_t) * segment_count * 2); // 8-byte
+
       } else {
+        // Se houve uma falha, executa o procedimento de recuperação
         Timer t;
         t.Start();
-        recovery(); // return later - OTAVIO
+        cout << "Last shutdown was dirty. Starting recovery process." << endl;
+        recovery(); // IMPORTANTE: A função recovery() também precisa ser adaptada para NUMA.
         t.Stop();
         cout << "graph recovery time: " << t.Seconds() << endl;
 
-        // persisting number of edges
-        bp->num_edges_ = num_edges_;
-        flush_clwb_nolog(&bp->num_edges_, sizeof(int64_t));
+        // Persiste o número correto de arestas após a recuperação
+        bp0->num_edges_ = n_edges_node0;
+        flush_clwb_nolog(&bp0->num_edges_, sizeof(int64_t));
+        bp1->num_edges_ = n_edges_node1;
+        flush_clwb_nolog(&bp1->num_edges_, sizeof(int64_t));
       }
 
       t_reboot.Stop();
       cout << "graph reboot time: " << t_reboot.Seconds() << endl;
-    }*/
+    }
   }
   #else
   CSRGraph(const char *file, const EdgeList &edge_list, bool is_directed, int64_t n_edges, int64_t n_vertices) {
@@ -1216,25 +1167,17 @@ public:
   #ifdef NUMA_PMEM
   #ifdef HASH_MODE
   int64_t out_degree(NodeID_ v) const {
-    if ((v%node_counter) == 0) {
-        // v pertence ao nó 0
-        return vertices_0[v/2].degree - 1;
-    } else {
-        // v pertence ao nó 1, converte para índice local
-        return vertices_1[v/2].degree - 1;
-    }
-}
-
-int64_t in_degree(NodeID_ v) const {
-    static_assert(MakeInverse, "Graph inversion disabled but reading inverse");
-    if ((v%node_counter) == 0) {
-      // v pertence ao nó 0
-      return vertices_0[v/2].degree - 1;
-  } else {
-      // v pertence ao nó 1, converte para índice local
-      return vertices_1[v/2].degree - 1;
+    bool is_node0 = (v % node_counter == 0);
+    int32_t local_idx = v / node_counter;
+    // O grau real é o número de entradas no array de arestas - 1 (para não contar a entrada de cabeçalho)
+    return is_node0 ? (vertices_0[local_idx].degree - 1) : (vertices_1[local_idx].degree - 1);
   }
-}
+
+  int64_t in_degree(NodeID_ v) const {
+    static_assert(MakeInverse, "Graph inversion disabled but reading inverse");
+    // Para um grafo não direcionado, o grau de entrada é igual ao de saída.
+    return out_degree(v);
+  }
   #else
   int64_t out_degree(NodeID_ v) const {
     if (v < n_vertices_node0) {
@@ -1270,9 +1213,10 @@ int64_t in_degree(NodeID_ v) const {
   #ifdef HASH_MODE
   Neighborhood out_neigh(NodeID_ n, OffsetT start_offset = 0) const {
     // round-robin: Pares no node 0, impares node 1
-    bool is0   = ((n & 1) == 0);
-    int   local = n / 2;
-    // Ponteiro para o vértice correto
+    bool is0   = ((n % node_counter) == 0);
+    int   local = n / node_counter;
+    
+    // Seleciona os ponteiros de vértice e aresta corretos (isto já estava correto)
     auto &V = is0 ? vertices_0 : vertices_1;
     auto &E = is0 ? edges_0    : edges_1;
     int   cap = is0 ? elem_capacity0 : elem_capacity1;
@@ -1280,7 +1224,6 @@ int64_t in_degree(NodeID_ v) const {
     int64_t idx = V[local].index;
     int32_t deg = V[local].degree;
 
-    // calcula limite: próximo local +1 ou fim do buffer
     int64_t next_boundary = (local + 1 < (is0 ? n_vertices_node0 : n_vertices_node1))
         ? (V[local + 1].index - 1)
         : (cap - 1);
@@ -1289,44 +1232,39 @@ int64_t in_degree(NodeID_ v) const {
         ? (int32_t)(next_boundary - idx + 1)
         : deg;
 
+    // --- LÓGICA DE LOG CORRIGIDA PARA NUMA HASH_MODE ---
+    // 1. Calcula o ID do segmento global onde o vértice 'n' reside.
+    int32_t global_seg_id = n / segment_size;
+
+    // 2. Determina em qual nó o LOG deste segmento está armazenado (partição meio a meio).
+    bool segment_log_on_node0 = (global_seg_id < segment_count0);
+    
+    // 3. Seleciona o array de ponteiros de log correto (log_ptr_0 ou log_ptr_1).
+    struct LogEntry** target_log_array = segment_log_on_node0 ? log_ptr_0 : log_ptr_1;
+
+    // 4. Calcula o índice LOCAL para usar no array de ponteiros de log.
+    int32_t local_seg_id = segment_log_on_node0 ? global_seg_id : (global_seg_id - segment_count0);
+
+    // 5. Obtém o ponteiro final para o log do segmento.
+    struct LogEntry* segment_log_entries = target_log_array[local_seg_id];
+    // --- FIM DA LÓGICA DE LOG CORRIGIDA ---
+
     return Neighborhood(
         E,
         (struct vertex_element*)(&V[local]),
         start_offset + 1,
-        log_ptr_[n / segment_size],
+        segment_log_entries, // <-- Usa o ponteiro correto e totalmente NUMA-aware
         onseg_edges
     );
-}
+  }
 
-
-Neighborhood in_neigh(NodeID_ n, OffsetT start_offset = 0) const {
+  Neighborhood in_neigh(NodeID_ n, OffsetT start_offset = 0) const {
     static_assert(MakeInverse, "Graph inversion disabled but reading inverse");
-    bool is0   = ((n & 1) == 0);
-    int   local = n / 2;
-
-    auto &V = is0 ? vertices_0 : vertices_1;
-    auto &E = is0 ? edges_0    : edges_1;
-    int   cap = is0 ? elem_capacity0 : elem_capacity1;
-
-    int64_t idx = V[local].index;
-    int32_t deg = V[local].degree;
-
-    int64_t next_boundary = (local + 1 < (is0 ? n_vertices_node0 : n_vertices_node1))
-        ? (V[local + 1].index - 1)
-        : (cap - 1);
-
-    int32_t onseg_edges = (V[local].offset != -1)
-        ? (int32_t)(next_boundary - idx + 1)
-        : deg;
-
-    return Neighborhood(
-        E,
-        (struct vertex_element*)(&V[local]),
-        start_offset + 1,
-        log_ptr_[n / segment_size],
-        onseg_edges
-    );
-}
+    // A lógica é idêntica à de out_neigh, então podemos simplesmente chamá-la.
+    // Isto evita duplicação de código e garante que qualquer futura correção
+    // seja aplicada a ambas.
+    return out_neigh(n, start_offset);
+  }
   #else
   Neighborhood out_neigh(NodeID_ n, OffsetT start_offset = 0) const {
     // índice local e qual array usar
@@ -1655,6 +1593,82 @@ Neighborhood in_neigh(NodeID_ n, OffsetT start_offset = 0) const {
    *****************************************************************************/
   /// Double the size of the "edges_" array
   #ifdef NUMA_PMEM
+  #ifdef HASH_MODE
+  /// Redimensiona os arrays de arestas, dobrando sua capacidade.
+/// Adaptado para NUMA.
+void resize_V1() {
+    // Dobra as capacidades de cada nó e a global.
+    int64_t old_elem_capacity0 = elem_capacity0;
+    int64_t old_elem_capacity1 = elem_capacity1;
+    elem_capacity0 *= 2;
+    elem_capacity1 *= 2;
+    elem_capacity *= 2;
+
+    // Calcula as novas posições para todos os vértices no novo espaço.
+    int64_t gaps = elem_capacity - num_edges_;
+    int64_t* new_indices = calculate_positions(0, num_vertices, gaps, num_edges_);
+
+    // Aloca os novos arrays de arestas na PMem de seus respectivos nós.
+    PMEMoid new_edges_oid_0, new_edges_oid_1;
+    if (pmemobj_zalloc(pop0, &new_edges_oid_0, elem_capacity0 * sizeof(DestID_), EDGE_TYPE)) abort();
+    if (pmemobj_zalloc(pop1, &new_edges_oid_1, elem_capacity1 * sizeof(DestID_), EDGE_TYPE)) abort();
+    DestID_* new_edges_0 = (DestID_*)pmemobj_direct(new_edges_oid_0);
+    DestID_* new_edges_1 = (DestID_*)pmemobj_direct(new_edges_oid_1);
+
+    // Copia os dados dos arrays antigos para os novos.
+    for (NodeID_ vi = 0; vi < num_vertices; ++vi) {
+        bool is_node0 = (vi % 2 == 0);
+        int32_t local_vi = vi / 2;
+
+        auto& V = is_node0 ? vertices_0 : vertices_1;
+        auto& old_E = is_node0 ? edges_0 : edges_1;
+        auto& new_E = is_node0 ? new_edges_0 : new_edges_1;
+
+        int64_t new_pos = new_indices[vi];
+        int32_t degree = V[local_vi].degree;
+
+        // Copia as arestas que estavam no array principal.
+        memcpy(&new_E[new_pos], &old_E[V[local_vi].index], degree * sizeof(DestID_));
+
+        // Se havia arestas no log, elas já foram consideradas no grau,
+        // mas precisamos garantir que a lógica de cópia as inclua.
+        // A implementação atual assume que `degree` é a contagem total.
+
+        V[local_vi].index = new_pos;
+        V[local_vi].offset = -1;
+    }
+
+    // Persiste os novos arrays.
+    flush_clwb_nolog(new_edges_0, elem_capacity0 * sizeof(DestID_));
+    flush_clwb_nolog(new_edges_1, elem_capacity1 * sizeof(DestID_));
+
+    // Libera os arrays antigos e atualiza os OIDs no objeto base.
+    pmemobj_free(&bp0->edges_oid_);
+    bp0->edges_oid_ = new_edges_oid_0;
+    flush_clwb_nolog(&bp0->edges_oid_, sizeof(PMEMoid));
+
+    pmemobj_free(&bp1->edges_oid_);
+    bp1->edges_oid_ = new_edges_oid_1;
+    flush_clwb_nolog(&bp1->edges_oid_, sizeof(PMEMoid));
+
+    // Atualiza os ponteiros em DRAM.
+    edges_0 = new_edges_0;
+    edges_1 = new_edges_1;
+
+    // Atualiza metadados e limpa todos os logs.
+    recount_segment_total();
+    free(new_indices);
+    for (int32_t i = 0; i < segment_count; ++i) {
+        release_log(i);
+    }
+
+    bp0->elem_capacity = elem_capacity0;
+    flush_clwb_nolog(&bp0->elem_capacity, sizeof(int64_t));
+    bp1->elem_capacity = elem_capacity1;
+    flush_clwb_nolog(&bp1->elem_capacity, sizeof(int64_t));
+}
+#else
+
   void resize_V1() {
     elem_capacity *= 2;
     elem_capacity0 *= 2;
@@ -1771,7 +1785,7 @@ Neighborhood in_neigh(NodeID_ n, OffsetT start_offset = 0) const {
       release_log(i - segment_count);
     }
   }
-  
+  #endif
   #else
   void resize_V1() {
     elem_capacity *= 2;
@@ -1852,6 +1866,49 @@ Neighborhood in_neigh(NodeID_ n, OffsetT start_offset = 0) const {
 
  
   #ifdef NUMA_PMEM
+  #ifdef HASH_MODE
+  void recount_segment_actual() {
+    // Zera os contadores de arestas atuais para ambos os nós.
+    memset(segment_edges_actual_0, 0, sizeof(int64_t) * segment_count0 * 2);
+    memset(segment_edges_actual_1, 0, sizeof(int64_t) * segment_count1 * 2);
+    n_edges_node0 = 0;
+    n_edges_node1 = 0;
+
+    // Itera sobre todos os vértices do grafo.
+    for (int32_t vid = 0; vid < num_vertices; ++vid) {
+        // Determina a qual nó o VÉRTICE pertence para obter seu grau.
+        bool vertex_on_node0 = (vid % 2 == 0);
+        int32_t local_vid = vid / 2;
+        int32_t degree = 0;
+
+        if (vertex_on_node0) {
+            if (local_vid < n_vertices_node0) {
+                degree = vertices_0[local_vid].degree;
+                n_edges_node0 += degree;
+            }
+        } else {
+            if (local_vid < n_vertices_node1) {
+                degree = vertices_1[local_vid].degree;
+                n_edges_node1 += degree;
+            }
+        }
+
+        if (degree == 0) continue;
+
+        // Determina a qual nó o SEGMENTO do vértice pertence para atualizar o contador correto.
+        int32_t global_seg_id = get_segment_id(vid) - segment_count;
+        bool seg_on_node0 = (global_seg_id < segment_count0);
+
+        if (seg_on_node0) {
+            // O índice no array da árvore PMA é o ID global + o offset do início das folhas.
+            segment_edges_actual_0[global_seg_id + segment_count] += degree;
+        } else {
+            int32_t local_seg_id = global_seg_id - segment_count0;
+            segment_edges_actual_1[local_seg_id + segment_count] += degree;
+        }
+    }
+}
+#else
    // Expected to run in single thread
    void recount_segment_actual() {
     // count the size of each segment in the tree
@@ -1892,6 +1949,7 @@ Neighborhood in_neigh(NodeID_ n, OffsetT start_offset = 0) const {
       } 
     }
   }
+  #endif
   #ifdef HASH_MODE
   void recount_segment_total() {
     // Zera todo o array de totais (nós internos + folhas)
@@ -1939,6 +1997,57 @@ Neighborhood in_neigh(NodeID_ n, OffsetT start_offset = 0) const {
         segment_edges_total[leaf_offset + i] = segment_total;
     }
 }
+
+/// Essencial para calcular o tamanho de um segmento no modo hash.
+inline int64_t get_global_offset(int32_t vid) const {
+    // Se o ID do vértice estiver fora dos limites, retorna a capacidade total.
+    if (vid >= num_vertices) {
+        return elem_capacity;
+    }
+
+    bool is_node0 = (vid % 2 == 0);
+    int32_t local_id = vid / 2;
+
+    if (is_node0) {
+        // Para vértices no nó 0, o índice já é o offset global.
+        return vertices_0[local_id].index;
+    } else {
+        // Para vértices no nó 1, o índice é local para edges_1.
+        // Somamos a capacidade de edges_0 para obter o offset global.
+        return elem_capacity0 + vertices_1[local_id].index;
+    }
+}
+
+
+/// Recalcula a capacidade total de arestas para os segmentos em um dado intervalo de vértices.
+/// Adaptado para o modo HASH.
+void recount_segment_total(int32_t start_vertex, int32_t end_vertex) {
+    // Determina o intervalo de segmentos a serem atualizados.
+    // O ID do segmento é o ID global (de 0 a segment_count-1).
+    int32_t start_seg = get_segment_id(start_vertex) - segment_count;
+    // O segmento final é o que contém o último vértice do intervalo.
+    int32_t end_seg = get_segment_id(end_vertex - 1) - segment_count;
+
+    // Itera sobre cada segmento que precisa de atualização.
+    for (int32_t i = start_seg; i <= end_seg; ++i) {
+        // Encontra o ID do primeiro vértice deste segmento e do próximo.
+        int32_t v_current_seg_start = i * segment_size;
+        int32_t v_next_seg_start = (i + 1) * segment_size;
+
+        // Calcula o offset global para o início do segmento atual e do próximo.
+        int64_t current_pos = get_global_offset(v_current_seg_start);
+        int64_t next_pos = get_global_offset(v_next_seg_start);
+
+        // A capacidade total do segmento é a diferença entre o início do próximo e o início do atual.
+        int64_t segment_total_p = next_pos - current_pos;
+
+        // O índice no array da árvore PMA é o ID global do segmento + o offset das folhas.
+        int32_t j = i + segment_count;
+        segment_edges_total[j] = segment_total_p;
+    }
+}
+
+
   #else
   void recount_segment_total() {
     // Zera o array de total de arestas para a partição do nó 0.
@@ -1977,7 +2086,7 @@ Neighborhood in_neigh(NodeID_ n, OffsetT start_offset = 0) const {
       segment_edges_total[j] = segment_total_p;
     }
 }
-#endif
+
 void recount_segment_total(int32_t start_vertex, int32_t end_vertex) {
   int32_t start_seg = get_segment_id(start_vertex);
   int32_t end_seg = get_segment_id(end_vertex);
@@ -2000,7 +2109,7 @@ void recount_segment_total(int32_t start_vertex, int32_t end_vertex) {
     
   }
 }
-
+#endif
 #else
  // Expected to run in single thread
  void recount_segment_actual() {
@@ -2349,7 +2458,256 @@ void recount_segment_total(int32_t start_vertex, int32_t end_vertex) {
   }
   #endif
 
-  #ifdef NUMA_PMEM //Fazer depois
+  #ifdef NUMA_PMEM
+  #ifdef HASH_MODE
+    /// Adaptado para NUMA.
+bool have_space_onseg(int32_t src, int64_t loc) const {
+    // Lógica in-line para determinar o nó e o índice local
+    bool is_node0 = (src % 2 == 0);
+    int32_t local_src = src / 2;
+
+    if (is_node0) {
+        // Lógica para o nó 0
+        // Verifica se é o último vértice no nó 0 ou se há espaço antes do próximo vértice.
+        return (local_src == (n_vertices_node0 - 1) && elem_capacity0 > loc) ||
+               (local_src < (n_vertices_node0 - 1) && vertices_0[local_src + 1].index > loc);
+    } else {
+        // Lógica para o nó 1
+        return (local_src == (n_vertices_node1 - 1) && elem_capacity1 > loc) ||
+               (local_src < (n_vertices_node1 - 1) && vertices_1[local_src + 1].index > loc);
+    }
+}
+
+
+/// Insere uma aresta no log do segmento apropriado.
+/// Adaptado para NUMA.
+inline void insert_into_log(int32_t segment_id, int32_t src, int32_t dst) {
+    // EXPLICAÇÃO: Os logs dos segmentos são divididos de forma contígua.
+    // Os primeiros 'segment_count0' logs pertencem ao nó 0, o restante ao nó 1.
+    bool seg_on_node0 = (segment_id < segment_count0);
+    int32_t local_seg_id = seg_on_node0 ? segment_id : segment_id - segment_count0;
+
+    auto& log_indices = seg_on_node0 ? log_segment_idx_0 : log_segment_idx_1;
+    auto& log_pointers = seg_on_node0 ? log_ptr_0 : log_ptr_1;
+
+    assert(log_indices[local_seg_id] < MAX_LOG_ENTRIES && "Log do segmento está cheio, rebalanceamento necessário.");
+
+    // Determina em qual nó o VÉRTICE está para buscar seu offset de log anterior.
+    bool vertex_on_node0 = (src % 2 == 0);
+    int32_t local_src_id = src / 2;
+    auto& vertices = vertex_on_node0 ? vertices_0 : vertices_1;
+
+    // Pega o ponteiro para a próxima entrada de log livre.
+    struct LogEntry* log_ins_ptr = (struct LogEntry*)(log_pointers[local_seg_id] + log_indices[local_seg_id]);
+    log_ins_ptr->u = src;
+    log_ins_ptr->v = dst;
+    log_ins_ptr->prev_offset = vertices[local_src_id].offset; // Pega o offset anterior do vértice correto.
+
+    flush_clwb_nolog(log_ins_ptr, sizeof(struct LogEntry));
+
+    // Atualiza o offset do vértice para apontar para a nova entrada de log.
+    vertices[local_src_id].offset = log_indices[local_seg_id];
+    log_indices[local_seg_id] += 1;
+}
+
+
+/// Realiza a inserção da aresta (lógica de baixo nível).
+/// Adaptado para NUMA com particionamento Round Robin.
+inline void do_insertion(int32_t src, int32_t dst, int32_t src_segment_global) {
+    // Determina o nó e o índice local do vértice de origem.
+    bool is_node0 = (src % 2 == 0);
+    int32_t local_src = src / 2;
+
+    // Seleciona as estruturas de dados corretas com base no nó.
+    auto& vertices = is_node0 ? vertices_0 : vertices_1;
+    auto& edges = is_node0 ? edges_0 : edges_1;
+    auto& segment_actuals = is_node0 ? segment_edges_actual_0 : segment_edges_actual_1;
+    auto& num_node_edges = is_node0 ? n_edges_node0 : n_edges_node1;
+
+    // O ID do segmento é global, mas para acessar os arrays de metadados (actuals, logs),
+    // precisamos saber a qual nó o *segmento* pertence.
+    int32_t global_seg_idx = src_segment_global - segment_count;
+    bool seg_on_node0 = (global_seg_idx < segment_count0);
+    int32_t local_seg_idx = seg_on_node0 ? global_seg_idx : global_seg_idx - segment_count0;
+    auto& log_indices = seg_on_node0 ? log_segment_idx_0 : log_segment_idx_1;
+
+    // Calcula a localização potencial da nova aresta.
+    int64_t loc = vertices[local_src].index + vertices[local_src].degree;
+
+    // Se houver espaço no array de arestas principal, insere diretamente.
+    if (have_space_onseg(src, loc)) {
+        edges[loc].v = dst;
+        flush_clwb_nolog(&edges[loc], sizeof(DestID_));
+    } else {
+        // Se não houver espaço, usa o log.
+        // Verifica se o log do segmento está cheio.
+        if (log_indices[local_seg_idx] >= MAX_LOG_ENTRIES) {
+            // Log cheio, precisa rebalancear o segmento antes de prosseguir.
+            int32_t left_index = (src / segment_size) * segment_size;
+            int32_t right_index = min(left_index + segment_size, num_vertices);
+
+            // O rebalanceamento precisa dos totais do segmento.
+            int64_t current_actuals = segment_actuals[local_seg_idx];
+            int64_t current_totals = segment_edges_total[global_seg_idx + segment_count]; // 'total' é global
+
+            rebalance_weighted(left_index, right_index, current_actuals, current_totals, src, dst);
+        }
+
+        // Tenta a inserção novamente após o possível rebalanceamento.
+        loc = vertices[local_src].index + vertices[local_src].degree;
+        if (have_space_onseg(src, loc)) {
+            edges[loc].v = dst;
+            flush_clwb_nolog(&edges[loc], sizeof(DestID_));
+        } else {
+            // Se ainda não houver espaço, insere no log.
+            insert_into_log(global_seg_idx, src, dst);
+        }
+    }
+
+    // Atualiza os metadados do nó correto.
+    vertices[local_src].degree += 1;
+    segment_actuals[local_seg_idx] += 1;
+
+    // Atualiza o contador total de arestas de forma atômica.
+    int64_t old_val, new_val;
+    do {
+        old_val = num_node_edges;
+        new_val = old_val + 1;
+    } while (!compare_and_swap(num_node_edges, old_val, new_val));
+}
+
+
+/// Função principal de inserção de arestas dinâmicas.
+/// Adaptada para NUMA.
+void insert(int32_t src, int32_t dst) {
+    int32_t current_segment_global = get_segment_id(src);
+    int32_t global_seg_idx = current_segment_global - segment_count;
+
+    // Travando o segmento da folha para garantir exclusão mútua.
+    unique_lock<mutex> ul(leaf_segments[global_seg_idx].lock);
+    leaf_segments[global_seg_idx].wait_for_rebalance(ul);
+
+    // Insere a aresta.
+    do_insertion(src, dst, current_segment_global);
+
+    // Agora, verifica se a inserção tornou o segmento muito denso,
+    // necessitando de um rebalanceamento.
+    int32_t left_index = src, right_index = src;
+    int32_t window = current_segment_global;
+
+    // EXPLICAÇÃO: A densidade deve ser lida dos arrays de metadados corretos.
+    double density;
+    bool seg_on_node0 = (global_seg_idx < segment_count0);
+    if (seg_on_node0) {
+        density = (double)(segment_edges_actual_0[global_seg_idx]) / (double)segment_edges_total[current_segment_global];
+    } else {
+        density = (double)(segment_edges_actual_1[global_seg_idx - segment_count0]) / (double)segment_edges_total[current_segment_global];
+    }
+
+    int32_t height = 0;
+    if (density >= up_0) {
+        // O segmento está muito cheio. Precisamos encontrar uma "janela" de rebalanceamento.
+        leaf_segments[global_seg_idx].on_rebalance += 1;
+        ul.unlock();
+
+        double up_height = up_0 - (height * delta_up);
+        pair<int64_t, int64_t> seg_meta;
+
+        while (window > 0) {
+            // Sobe um nível na árvore PMA conceitual.
+            window /= 2;
+            height += 1;
+
+            int32_t window_size = segment_size * (1 << height);
+            left_index = (src / window_size) * window_size;
+            right_index = min(left_index + window_size, num_vertices);
+
+            int32_t left_segment = get_segment_id(left_index) - segment_count;
+            int32_t right_segment = get_segment_id(right_index) - segment_count;
+
+            // Trava todos os segmentos na janela encontrada.
+            // A função lock_in_batch também precisará ser NUMA-aware para somar os valores corretamente.
+            seg_meta = lock_in_batch(left_segment, right_segment, global_seg_idx);
+            up_height = up_0 - (height * delta_up);
+            density = (double)seg_meta.first / (double)seg_meta.second;
+
+            if (density < up_height) {
+                // Encontramos uma janela que está dentro do limiar de densidade.
+                break;
+            } else {
+                // Esta janela ainda está muito cheia, destrava e tenta uma maior.
+                unlock_in_batch(left_segment, right_segment, global_seg_idx);
+            }
+        }
+
+        if (!height) {
+            cout << "Isso não deveria acontecer! Abortando!" << endl;
+            exit(-1);
+        }
+
+        if (window) {
+            // Encontrou uma janela válida para rebalancear.
+            int32_t window_size = segment_size * (1 << height);
+            left_index = (src / window_size) * window_size;
+            right_index = min(left_index + window_size, num_vertices);
+
+            // Recalcula a densidade do segmento original para uma checagem final.
+            if (seg_on_node0) {
+                density = (double)(segment_edges_actual_0[global_seg_idx]) / (double)segment_edges_total[current_segment_global];
+            } else {
+                density = (double)(segment_edges_actual_1[global_seg_idx - segment_count0]) / (double)segment_edges_total[current_segment_global];
+            }
+
+            if (density >= up_0) {
+                rebalance_weighted(left_index, right_index, seg_meta.first, seg_meta.second, src, dst);
+            }
+        } else {
+            // Nenhuma janela encontrada, significa que o grafo inteiro está cheio.
+            // Precisamos redimensionar todo o array de arestas.
+            int32_t left_segment = 0;
+            int32_t right_segment = segment_count;
+
+            if (density < up_0) {
+                 // Outra thread pode ter resolvido o problema.
+                 unlock_in_batch(left_segment, right_segment);
+                 return;
+            }
+            seg_meta = lock_in_batch(left_segment, right_segment, global_seg_idx);
+            resize_V1(); // Esta função também precisa ser totalmente NUMA-aware.
+        }
+
+        // Destrava os segmentos que foram travados para o rebalanceamento.
+        int32_t left_segment = get_segment_id(left_index) - segment_count;
+        int32_t right_segment = get_segment_id(right_index) - segment_count;
+        unlock_in_batch(left_segment, right_segment);
+    } else {
+        // O segmento não está muito cheio, apenas destrava e termina.
+        ul.unlock();
+    }
+}
+
+/// Limpa as entradas de log para um determinado segmento.
+/// Adaptado para NUMA.
+inline void release_log(int32_t global_segment_id) {
+    // Determina a qual nó o log do segmento pertence.
+    bool seg_on_node0 = (global_segment_id < segment_count0);
+    int32_t local_seg_id = seg_on_node0 ? global_segment_id : global_segment_id - segment_count0;
+
+    // Seleciona os ponteiros e índices de log corretos.
+    auto& log_indices = seg_on_node0 ? log_segment_idx_0 : log_segment_idx_1;
+    auto& log_pointers = seg_on_node0 ? log_ptr_0 : log_ptr_1;
+
+    if (log_indices[local_seg_id] == 0) return; // Nada a fazer se o log estiver vazio.
+
+    int num_entries_to_clear = log_indices[local_seg_id];
+    memset(log_pointers[local_seg_id], 0, sizeof(struct LogEntry) * num_entries_to_clear);
+
+    flush_clwb_nolog(log_pointers[local_seg_id], sizeof(struct LogEntry) * num_entries_to_clear);
+    log_indices[local_seg_id] = 0; // Reseta o índice do log.
+}
+
+
+  #else
   // Verifica se há espaço disponível para inserção no segmento
   bool have_space_onseg(int32_t src, int64_t loc, int32_t current_segment) {
     if (src < n_vertices_node0) {
@@ -2613,6 +2971,7 @@ inline void insert_into_log(int32_t segment_id, int32_t src, int32_t dst) {
     log_segment_idx_[segment_id] = 0;
   }
   
+  #endif
   #else
   bool have_space_onseg(int32_t src, int64_t loc) {
     if ((src == (num_vertices - 1) && elem_capacity > loc)
@@ -2825,44 +3184,65 @@ inline void insert_into_log(int32_t segment_id, int32_t src, int32_t dst) {
   #ifdef NUMA_PMEM
   #ifdef HASH_MODE
   void spread_weighted(int32_t start_vertex, int32_t end_vertex) {
-    assert(start_vertex == 0 && "start-vertex is expected to be 0 here.");
-    int64_t gaps = elem_capacity - (n_edges_node1 + n_edges_node0);
-    int64_t *new_positions = calculate_positions(start_vertex, end_vertex, gaps, (n_edges_node1 + n_edges_node0));
+      assert(start_vertex == 0 && "start_vertex is expected to be 0 here.");
+      // NOTA: Para a versão NUMA, assumimos uma redistribuição completa.
+      // Os parâmetros start/end_vertex são mantidos para compatibilidade de API.
+      
+      // As operações para o nó 0 e nó 1 são completamente independentes
+      // e podem ser executadas em paralelo para um ganho de desempenho.
+      #pragma omp parallel sections
+      {
+          #pragma omp section
+          {
+              // Espalha os vértices dentro da memória do Nó 0
+              spread_weighted_for_node(n_vertices_node0, vertices_0, edges_0, elem_capacity0, n_edges_node0);
+          }
 
-    int64_t read_index, write_index, curr_degree;
-    for (int32_t curr_vertex = end_vertex - 1; curr_vertex > start_vertex; curr_vertex -= 1) {
-      bool is0 = !(curr_vertex & 1);
-      int local = curr_vertex / 2;
-      int64_t deg;
-      if (is0) {
-          deg = vertices_0[local].degree;
-          read_index  = vertices_0[local].index + deg - 1;
-          write_index = new_positions[curr_vertex - start_vertex] + deg - 1;
-      } else {
-          deg = vertices_1[local].degree;
-          read_index  = vertices_1[local].index + deg - 1;
-          write_index = new_positions[curr_vertex - start_vertex] + deg - 1;
+          #pragma omp section
+          {
+              // Espalha os vértices dentro da memória do Nó 1
+              spread_weighted_for_node(n_vertices_node1, vertices_1, edges_1, elem_capacity1, n_edges_node1);
+          }
       }
-
-      assert(write_index >= read_index && "index anomaly occurred while spreading elements");
-      for (int i = 0; i < deg; ++i) {
-          if (is0)
-              edges_0[write_index] = edges_0[read_index];
-          else
-              edges_1[write_index] = edges_1[read_index];
-          --write_index;
-          --read_index;
-      }
-
-      if (is0)
-          vertices_0[local].index = new_positions[curr_vertex - start_vertex];
-      else
-          vertices_1[local].index = new_positions[curr_vertex - start_vertex];
+      
+      // Após a redistribuição em ambos os nós, recalcula os totais globais se necessário.
+      recount_segment_total();
   }
+inline pair<int64_t, int64_t> lock_in_batch(int32_t left_segment, int32_t right_segment, int32_t src_segment_to_exclude) {
+    pair<int64_t, int64_t> ret = make_pair(0l, 0l);
+    int32_t old_val, new_val;
 
-    free(new_positions);
-    recount_segment_total();
-  }
+    // Itera sobre o intervalo de segmentos globais.
+    for (int32_t seg_id = left_segment; seg_id < right_segment; seg_id += 1) {
+        if (seg_id != src_segment_to_exclude) {
+            // Incrementa o contador para sinalizar que um rebalanceamento está pendente.
+            // Isso previne que outras threads tentem usar o segmento enquanto ele é modificado.
+            do {
+                old_val = leaf_segments[seg_id].on_rebalance;
+                new_val = old_val + 1;
+            } while (!compare_and_swap(leaf_segments[seg_id].on_rebalance, old_val, new_val));
+        }
+
+        leaf_segments[seg_id].lock.lock(); // Adquire o lock do segmento.
+
+        // Acumula os metadados (arestas atuais vs. espaço total).
+        // O array 'segment_edges_total' é global, então o índice é direto.
+        ret.second += segment_edges_total[seg_id + segment_count];
+
+        // O array 'segment_edges_actual' é particionado.
+        // Verificamos a qual nó o segmento pertence para ler do array correto.
+        bool seg_on_node0 = (seg_id < segment_count0);
+        if (seg_on_node0) {
+            ret.first += segment_edges_actual_0[seg_id];
+        } else {
+            ret.first += segment_edges_actual_1[seg_id - segment_count0];
+        }
+    }
+    return ret;
+}
+
+
+
   #else
   void spread_weighted(int32_t start_vertex, int32_t end_vertex) {
     assert(start_vertex == 0 && "start-vertex is expected to be 0 here.");
@@ -2918,7 +3298,7 @@ inline void insert_into_log(int32_t segment_id, int32_t src, int32_t dst) {
     new_positions = nullptr;
     recount_segment_total();
   }
-#endif
+
 
   /// Take the locks of the segments [@left_segment, @right_segment); exclude @src_segment to increment the CV counter
   inline pair <int64_t, int64_t> lock_in_batch(int32_t left_segment, int32_t right_segment, int32_t src_segment) {
@@ -2945,6 +3325,7 @@ inline void insert_into_log(int32_t segment_id, int32_t src, int32_t dst) {
     }
     return ret;
   }
+  #endif
   #else
   void spread_weighted(int32_t start_vertex, int32_t end_vertex) {
     assert(start_vertex == 0 && "start-vertex is expected to be 0 here.");
@@ -3046,39 +3427,290 @@ inline void insert_into_log(int32_t segment_id, int32_t src, int32_t dst) {
   /// @gaps are the sum of empty spaces after the per-vertex neighbors of [@start_vertex, @end_vertex)
   #ifdef NUMA_PMEM
   #ifdef HASH_MODE
-  int64_t *calculate_positions(int32_t start_vertex, int32_t end_vertex, int64_t gaps, int64_t total_degree) {
+int64_t *calculate_positions(int32_t start_vertex, int32_t end_vertex, int64_t gaps, int64_t total_degree) {
     int32_t size = end_vertex - start_vertex;
-    int64_t *new_index = (int64_t *) calloc(size, sizeof(int64_t));
-    // Ajusta o total considerando um incremento por vértice
-    total_degree += size;
-    
-    double step = ((double) gaps) / total_degree;  // passo por aresta
-    // Cria um vetor para cada um
-    std::vector<int64_t> pos0(n_vertices_node0), pos1(n_vertices_node1);
-    {
-      double nIndex0 = vertices_0[0].index;
-      for (int i = 0; i < n_vertices_node0; i++) {
-        pos0[i] = int64_t(nIndex0);
-        nIndex0 += vertices_0[i].degree + step*(vertices_0[i].degree + 1);
-      }
-    }
-    {
-      double nIndex1 = vertices_1[0].index;
-      for (int i = 0; i < n_vertices_node0; i++) {
-        pos1[i] = int64_t(nIndex1);
-        nIndex1 += vertices_1[i].degree + step*(vertices_1[i].degree + 1);
-      }
+    if (size <= 0) {
+        return nullptr;
     }
 
-    // Junta os dois vetores
-    for (int v = start_vertex; v < end_vertex; v++) {
-      int64_t p = (v & 1) == 0
-                ? pos0[v/2]
-                : pos1[v/2];
-                new_index[v - start_vertex] = p;
+    int64_t *new_index = (int64_t *) calloc(size, sizeof(int64_t));
+    if (!new_index) {
+        perror("calloc failed for new_index");
+        exit(1);
     }
+
+    // --- Passo 1: Separar vértices e calcular graus por nó ---
+    vector<int32_t> node0_vids, node1_vids;
+    int64_t degree_sum_node0 = 0;
+    int64_t degree_sum_node1 = 0;
+
+    for (int32_t i = 0; i < size; ++i) {
+        int32_t vid = start_vertex + i;
+        bool is_node0 = (vid % 2 == 0);
+        int32_t local_id = vid / 2;
+
+        if (is_node0) {
+            node0_vids.push_back(vid);
+            degree_sum_node0 += vertices_0[local_id].degree;
+        } else {
+            node1_vids.push_back(vid);
+            degree_sum_node1 += vertices_1[local_id].degree;
+        }
+    }
+
+    // --- Passo 2: Distribuir os gaps proporcionalmente ---
+    int64_t total_units = (degree_sum_node0 + node0_vids.size()) + (degree_sum_node1 + node1_vids.size());
+    if (total_units <= 0) total_units = 1; // Evitar divisão por zero
+
+    double gap_ratio_node0 = (double)(degree_sum_node0 + node0_vids.size()) / total_units;
+    double gap_ratio_node1 = 1.0 - gap_ratio_node0;
+
+    int64_t gaps_node0 = (int64_t)(gaps * gap_ratio_node0);
+    int64_t gaps_node1 = gaps - gaps_node0;
+
+    // --- Passo 3: Calcular novas posições para o Nó 0 ---
+    if (!node0_vids.empty()) {
+        int64_t total_units_node0 = degree_sum_node0 + node0_vids.size();
+        double step0 = (total_units_node0 > 0) ? (double)gaps_node0 / total_units_node0 : 0.0;
+
+        int32_t first_vid_node0 = node0_vids[0];
+        double current_pos0 = vertices_0[first_vid_node0 / 2].index;
+
+        for (int32_t vid : node0_vids) {
+            int32_t local_id = vid / 2;
+            // A posição no array new_index é relativa ao início da janela.
+            new_index[vid - start_vertex] = round(current_pos0);
+            current_pos0 += (vertices_0[local_id].degree + (step0 * (vertices_0[local_id].degree + 1)));
+        }
+    }
+
+    // --- Passo 4: Calcular novas posições para o Nó 1 ---
+    if (!node1_vids.empty()) {
+        int64_t total_units_node1 = degree_sum_node1 + node1_vids.size();
+        double step1 = (total_units_node1 > 0) ? (double)gaps_node1 / total_units_node1 : 0.0;
+
+        int32_t first_vid_node1 = node1_vids[0];
+        double current_pos1 = vertices_1[first_vid_node1 / 2].index;
+
+        for (int32_t vid : node1_vids) {
+            int32_t local_id = vid / 2;
+            new_index[vid - start_vertex] = round(current_pos1);
+            current_pos1 += (vertices_1[local_id].degree + (step1 * (vertices_1[local_id].degree + 1)));
+        }
+    }
+
     return new_index;
-  }
+}
+/// Rebalanceia uma janela de vértices para ajustar a densidade das arestas.
+/// Adaptado para NUMA.
+void rebalance_weighted(int32_t start_vertex, int32_t end_vertex,
+                        int64_t used_space, int64_t total_space,
+                        int32_t src = -1, int32_t dst = -1) {
+
+    int64_t gaps = total_space - used_space;
+    int64_t* new_index = calculate_positions(start_vertex, end_vertex, gaps, used_space);
+
+    rebalance_data_V1(start_vertex, end_vertex, new_index);
+
+    free(new_index);
+    new_index = nullptr;
+    recount_segment_total(start_vertex, end_vertex);
+}
+
+/// Carrega uma porção de um array de arestas para o undo-log para garantir consistência em caso de falha.
+/// Adaptado para NUMA.
+inline void load_into_ulog(int tid, DestID_* edge_array, int64_t edge_array_capacity,
+                           int64_t load_idx_st, int32_t load_sz,
+                           int64_t flush_idx_st, int64_t flush_idx_nd) {
+    // Determina a qual nó a thread pertence para usar o ulog correto.
+    // Assumimos uma divisão simples de threads entre os nós.
+    int num_threads_node0 = num_threads / 2;
+    bool thread_on_node0 = (tid < num_threads_node0);
+
+    auto& ulog_pointers = thread_on_node0 ? ulog_ptr_0 : ulog_ptr_1;
+    auto& oplog_pointers = thread_on_node0 ? oplog_ptr_0 : oplog_ptr_1;
+    int local_tid = thread_on_node0 ? tid : tid - num_threads_node0;
+
+    // Persiste as últimas modificações feitas no array de arestas antes de carregar uma nova janela no log.
+    if (flush_idx_st != flush_idx_nd) {
+        flush_clwb_nolog(&edge_array[flush_idx_st], sizeof(DestID_) * (flush_idx_nd - flush_idx_st));
+    }
+
+    // Copia a próxima janela do array de arestas para o ulog da thread.
+    memcpy(ulog_pointers[local_tid], edge_array + load_idx_st, sizeof(DestID_) * load_sz);
+    flush_clwb_nolog(ulog_pointers[local_tid], sizeof(DestID_) * MAX_ULOG_ENTRIES);
+
+    // Registra a posição do array de arestas que foi salva no log.
+    oplog_pointers[local_tid] = load_idx_st;
+    flush_clwb_nolog(&oplog_pointers[local_tid], sizeof(int64_t));
+}
+
+
+/// Obtém o 'index' (posição inicial da lista de arestas) de um vértice.
+/// Lida com a partição por hash.
+inline int64_t get_old_index(int32_t vid) const {
+    if (vid >= num_vertices) return elem_capacity; // Limite para o último vértice
+    bool is_node0 = (vid % 2 == 0);
+    int32_t local_id = vid / 2;
+    if (is_node0) {
+        return (local_id < n_vertices_node0) ? vertices_0[local_id].index : -1;
+    } else {
+        return (local_id < n_vertices_node1) ? vertices_1[local_id].index : -1;
+    }
+}
+
+/// Obtém o grau de um vértice.
+/// Lida com a partição por hash.
+inline int32_t get_degree(int32_t vid) const {
+    if (vid >= num_vertices) return 0;
+    bool is_node0 = (vid % 2 == 0);
+    int32_t local_id = vid / 2;
+    if (is_node0) {
+        return (local_id < n_vertices_node0) ? vertices_0[local_id].degree : 0;
+    } else {
+        return (local_id < n_vertices_node1) ? vertices_1[local_id].degree : 0;
+    }
+}
+
+
+inline void rebalance_node_data(int node_id, int32_t start_vertex, int32_t end_vertex, int64_t* new_index) {
+    int tid = omp_get_thread_num();
+    
+    // Estruturas locais do nó
+    auto& V = (node_id == 0) ? vertices_0 : vertices_1;
+    auto& E = (node_id == 0) ? edges_0 : edges_1;
+    auto& log_pointers = (node_id == 0) ? log_ptr_0 : log_ptr_1;
+    int64_t node_edge_offset = (node_id == 0) ? 0 : elem_capacity0;
+    int64_t node_capacity = (node_id == 0) ? elem_capacity0 : elem_capacity1;
+    
+    // Calcula vértices que pertencem a este nó
+    int32_t node_start = start_vertex + (node_id - (start_vertex % 2) + 2) % 2;
+    int32_t node_end = end_vertex;
+    
+    // Ajusta para começar no primeiro vértice do nó correto
+    if (node_start < start_vertex) node_start += 2;
+    
+    // Processa em chunks para melhor cache locality
+    int32_t chunk_size = 128; // Otimizado para L1 cache
+    
+    for (int32_t chunk_start = node_start; chunk_start < node_end; chunk_start += chunk_size * 2) {
+        int32_t chunk_end = std::min(chunk_start + chunk_size * 2, node_end);
+        
+        // Processa chunk em ordem reversa (mantém consistência com versão original)
+        for (int32_t jj = chunk_end - 2; jj >= chunk_start; jj -= 2) {
+            // Verifica se o vértice pertence ao nó correto
+            if ((jj % 2) != node_id) continue;
+            
+            int32_t local_jj = jj / 2;
+            int32_t total_degree = V[local_jj].degree;
+            
+            if (total_degree == 0) {
+                V[local_jj].index = new_index[jj - start_vertex];
+                continue;
+            }
+            
+            // Calcula posições antigas e novas
+            int64_t old_global_pos = V[local_jj].index;
+            int64_t old_local_pos = old_global_pos - node_edge_offset;
+            int64_t new_global_pos = new_index[jj - start_vertex];
+            int64_t new_local_pos = new_global_pos - node_edge_offset;
+            
+            // Determina boundary do próximo vértice
+            int64_t next_vertex_boundary;
+            int32_t next_global_vid = jj + 2; // Próximo vértice no mesmo nó
+            
+            if (next_global_vid >= num_vertices) {
+                next_vertex_boundary = node_capacity;
+            } else {
+                int32_t next_local_id = next_global_vid / 2;
+                next_vertex_boundary = V[next_local_id].index - node_edge_offset;
+            }
+            
+            int32_t on_segment_count = next_vertex_boundary - old_local_pos;
+            
+            // Otimização: se não há movimento, só atualiza metadados
+            if (old_local_pos == new_local_pos && V[local_jj].offset == -1) {
+                continue;
+            }
+            
+            // Move dados do segmento se necessário
+            if (on_segment_count > 0 && old_local_pos != new_local_pos) {
+                // Usa memmove para handles overlap corretamente
+                memmove(&E[new_local_pos], &E[old_local_pos], 
+                       on_segment_count * sizeof(DestID_));
+            }
+            
+            // Processa dados do log se existirem
+            if (V[local_jj].offset != -1) {
+                int32_t global_seg_id = get_segment_id(jj) - segment_count;
+                int32_t local_seg_id = (node_id == 0) ? global_seg_id : global_seg_id - segment_count0;
+                
+                // Valida se o segmento pertence ao nó correto
+                bool seg_belongs_to_node = (node_id == 0) ? (global_seg_id < segment_count0) : 
+                                          (global_seg_id >= segment_count0);
+                
+                if (seg_belongs_to_node) {
+                    int32_t curr_off = V[local_jj].offset;
+                    int64_t write_pos = new_local_pos + on_segment_count;
+                    
+                    // Move arestas do log diretamente para posição final
+                    while(curr_off != -1) {
+                        E[write_pos].v = log_pointers[local_seg_id][curr_off].v;
+                        curr_off = log_pointers[local_seg_id][curr_off].prev_offset;
+                        write_pos++;
+                    }
+                }
+            }
+            
+            // Atualiza metadados do vértice
+            V[local_jj].index = new_global_pos;
+            V[local_jj].offset = -1;
+        }
+    }
+}
+
+
+/// Move os dados das arestas para as novas posições, usando undo-logs para consistência.
+// Função principal otimizada com divisão por nó NUMA
+inline void rebalance_data_V1(int32_t start_vertex, int32_t end_vertex, int64_t* new_index, bool from_resize = false) {
+    
+    // Versão paralela que processa cada nó NUMA separadamente
+    #pragma omp parallel sections num_threads(2)
+    {
+        #pragma omp section
+        {
+            // Thread 0: processa apenas vértices pares (nó 0)
+            rebalance_node_data(0, start_vertex, end_vertex, new_index);
+        }
+        
+        #pragma omp section
+        {
+            // Thread 1: processa apenas vértices ímpares (nó 1)  
+            rebalance_node_data(1, start_vertex, end_vertex, new_index);
+        }
+    }
+    
+    // Limpa logs de todos os segmentos afetados (uma vez só no final)
+    int32_t st_seg = get_segment_id(start_vertex) - segment_count;
+    int32_t nd_seg = get_segment_id(end_vertex - 1) - segment_count + 1;
+    
+    // Limpa logs do nó 0
+    #pragma omp parallel for
+    for (int32_t seg_id = st_seg; seg_id < nd_seg; ++seg_id) {
+        if (seg_id < segment_count0) {
+            release_log(seg_id);
+        }
+    }
+    
+    // Limpa logs do nó 1  
+    #pragma omp parallel for
+    for (int32_t seg_id = st_seg; seg_id < nd_seg; ++seg_id) {
+        if (seg_id >= segment_count0) {
+            release_log(seg_id - segment_count0);
+        }
+    }
+}
+
 #else
   int64_t *calculate_positions(int32_t start_vertex, int32_t end_vertex, int64_t gaps, int64_t total_degree) {
       int32_t size = end_vertex - start_vertex;
@@ -3153,7 +3785,6 @@ inline void insert_into_log(int32_t segment_id, int32_t src, int32_t dst) {
       }
       return new_index;
   }
-#endif
 
   void rebalance_weighted(int32_t start_vertex,
     int32_t end_vertex,
@@ -3207,6 +3838,8 @@ inline void insert_into_log(int32_t segment_id, int32_t src, int32_t dst) {
     new_index = nullptr;
     recount_segment_total(start_vertex, end_vertex);
   }
+
+  
   inline void
   load_into_ulog(int tid, int64_t load_idx_st, int32_t load_sz, int64_t flush_idx_st, int64_t flush_idx_nd) {
     // flush the last entries
@@ -3434,7 +4067,7 @@ inline void
       release_log(i - segment_count);
     }
   }
-
+#endif
 #else
   int64_t *calculate_positions(int32_t start_vertex, int32_t end_vertex, int64_t gaps, int64_t total_degree) {
     int32_t size = end_vertex - start_vertex;
@@ -3605,6 +4238,7 @@ inline void
     }
   }
   #endif
+
 private:
   bool directed_;
   int64_t max_size = (1ULL << 56) - 1ULL;
@@ -3658,8 +4292,13 @@ private:
   int32_t *log_segment_idx_;              // current insert-index of logs per segment
   int64_t *segment_edges_actual;          // actual number of edges stored in the region of a binary-tree node
   int64_t *segment_edges_total;           // total number of edges assigned in the region of a binary-tree node
-
   struct PMALeafSegment *leaf_segments;   // pma-leaf segments to control concurrency
+#ifdef NUMA_PMEM
+  struct LogEntry *log_base_ptr_0;         // mapping of pmem::log_segment_oid_
+  struct LogEntry **log_ptr_0; 
+    struct LogEntry *log_base_ptr_1;         // mapping of pmem::log_segment_oid_
+  struct LogEntry **log_ptr_1; 
+#endif
 
   int num_threads;                        // max (available) number of concurrent write threads
   int node_counter;                          // Number of nodes available in a NUMA system
@@ -3667,12 +4306,87 @@ private:
   DestID_ **ulog_ptr_;                    // array of undo-log pointers (array size is number of write threads)
   int64_t *oplog_ptr_;                    // keeps the start index in the edge array that is backed up in undo-log
   #ifdef NUMA_PMEM
+  DestID_ *ulog_base_ptr_0;
+  DestID_ *ulog_base_ptr_1;
   int32_t *log_segment_idx_0;
   int32_t *log_segment_idx_1;
   int64_t *segment_edges_actual_0;   
   int64_t *segment_edges_actual_1;          // actual number of edges stored in the region of a binary-tree node
-  int64_t *oplog_ptr_0;
-  int64_t *oplog_ptr_1;
+  DestID_ **ulog_ptr_0;                    // array of undo-log pointers (array size is number of write threads)
+  int64_t *oplog_ptr_0;                    // keeps the start index in the edge array that is backed up in undo-log
+  DestID_ **ulog_ptr_1;                    // array of undo-log pointers (array size is number of write threads)
+  int64_t *oplog_ptr_1;                    // keeps the start index in the edge array that is backed up in undo-log
+
+  int64_t* calculate_positions_for_node(
+      int32_t num_local_vertices,
+      const struct vertex_element* local_vertices,
+      int64_t local_elem_capacity,
+      int64_t local_num_edges)
+  {
+      if (num_local_vertices == 0) return nullptr;
+
+      int64_t* new_positions = (int64_t*) calloc(num_local_vertices, sizeof(int64_t));
+      int64_t gaps = local_elem_capacity - local_num_edges;
+      if (gaps < 0) {
+          // Isso pode acontecer se a inserção inicial encheu a capacidade. Não há espaço para espalhar.
+          gaps = 0;
+      }
+
+      // O "step" é a quantidade de espaço extra a ser adicionada por unidade de grau.
+      double step = (local_num_edges > 0) ? ((double) gaps) / local_num_edges : 0.0;
+      
+      double current_pos_float = 0.0; // Usamos double para acumular a fração do step
+
+      for (int i = 0; i < num_local_vertices; ++i) {
+          new_positions[i] = round(current_pos_float);
+          
+          // A nova posição é a atual + o tamanho do vértice + o gap proporcional ao seu tamanho.
+          current_pos_float += (local_vertices[i].degree + (step * local_vertices[i].degree));
+      }
+
+      return new_positions;
+  }
+
+  void spread_weighted_for_node(
+      int32_t num_local_vertices,
+      struct vertex_element* local_vertices,
+      DestID_* local_edges,
+      int64_t local_elem_capacity,
+      int64_t local_num_edges)
+  {
+      if (num_local_vertices == 0) return;
+
+      int64_t* new_positions = calculate_positions_for_node(num_local_vertices, local_vertices, local_elem_capacity, local_num_edges);
+      if (!new_positions) return;
+
+      // Iteramos de trás para frente para garantir que não sobrescrevemos dados
+      // que ainda precisamos ler.
+      for (int32_t local_v_idx = num_local_vertices - 1; local_v_idx >= 0; --local_v_idx) {
+          int64_t curr_degree = local_vertices[local_v_idx].degree;
+          if (curr_degree == 0) continue; // Vértice vazio, nada a mover.
+
+          int64_t read_index  = local_vertices[local_v_idx].index;
+          int64_t write_index = new_positions[local_v_idx];
+
+          if (write_index < read_index) {
+              // Isso não deveria acontecer em um "spread", mas é bom ter a verificação.
+              // Se acontecer, indica um bug no cálculo das posições.
+              assert(false && "Index anomaly: write position is smaller than read position.");
+              continue;
+          }
+
+          if (write_index > read_index) {
+              // memmove é ideal para mover blocos de memória que podem se sobrepor.
+              memmove(&local_edges[write_index], &local_edges[read_index], curr_degree * sizeof(DestID_));
+          }
+          // Se write_index == read_index, não é necessário fazer nada.
+
+          // Atualiza o índice do vértice para sua nova posição.
+          local_vertices[local_v_idx].index = write_index;
+      }
+
+      free(new_positions);
+  }
   #endif
   
 };

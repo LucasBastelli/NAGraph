@@ -135,7 +135,6 @@ class BuilderBase {
     }
     #endif
     CSRGraph<NodeID_, DestID_, invert> g(cli_.dbfilename1().c_str(), cli_.dbfilename2().c_str(), el, !symmetrize_, base_graph_num_edges_, num_nodes_);
-    /*
     if(needs_ingestion_) {
       el.clear();
 
@@ -153,12 +152,12 @@ class BuilderBase {
 
 //      #pragma omp parallel for
       
-      g.print_vertices();
+      //g.print_vertices();
       //g.print_edges();
-      //#pragma omp parallel for schedule(dynamic, 1048576)   // 1024 * 1024
+      #pragma omp parallel for schedule(dynamic, 1048576)   // 1024 * 1024
       for (uint64_t i = 0; i < dynamic_edges; i += 1) {
         g.insert(el[i].u, el[i].v.v);
-        printf("Inseriu\n");
+        //printf("Inseriu\n");
         if (symmetrize_) {
           g.insert(el[i].v.v, el[i].u);
         }
@@ -167,9 +166,8 @@ class BuilderBase {
       t.Stop();
       cout << "D-Graph Build Time: " << t.Seconds() << " seconds." << endl;
     }
-    g.print_vertices();
+    //g.print_vertices();
     printf("terminou inserção dinamica\n");
-    */
     //g.print_vertices();
     return g;
   }

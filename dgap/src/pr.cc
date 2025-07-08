@@ -184,13 +184,14 @@ ScoreT *PageRankPullNuma(const WGraph &g, int max_iters, double epsilon = 0) {
     }
     //printf("TID: %d, my count: %ld\n", tid, my_count);
   } // fim do parallel
-
+  PrintTopScores(g, scores);
   return scores;
 }
 
 
 ScoreT * PageRankPull(const WGraph &g, int max_iters,
   double epsilon = 0) {
+    printf("Até aqui 1.1\n");
   const ScoreT init_score = 1.0f / g.num_nodes();
   const ScoreT base_score = (1.0f - kDamp) / g.num_nodes();
   ScoreT *scores;
@@ -198,10 +199,8 @@ ScoreT * PageRankPull(const WGraph &g, int max_iters,
 
   scores = (ScoreT *) malloc(sizeof(ScoreT) * g.num_nodes());
   outgoing_contrib = (ScoreT *) malloc(sizeof(ScoreT) * g.num_nodes());
-
   #pragma omp parallel for
   for (NodeID n=0; n < g.num_nodes(); n++) scores[n] = init_score;
-
   for (int iter=0; iter < max_iters; iter++) {
     double error = 0;
     #pragma omp parallel for
